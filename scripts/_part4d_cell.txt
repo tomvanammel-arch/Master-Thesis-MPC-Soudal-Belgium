@@ -1,0 +1,294 @@
+# Part 4D — Savings vs baseline, split by cost component (stacked bars; Notebook 09 style)
+#
+# Components:
+# - Energy cost
+# - Spot cost
+# - Access power cost
+# - Monthly peak cost
+# - Over-usage cost
+# - Injection revenue (plotted as savings contribution: scenario_rev - baseline_rev)
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from billing import load_billing_config, calculate_monthly_bills, calculate_monthly_injection_bills
+
+PROJECT_ROOT = Path("..").resolve()
+NOTEBOOKS_OUTPUT_DIR = PROJECT_ROOT / "output" / "notebooks"
+SUMMARY_CSV = NOTEBOOKS_OUTPUT_DIR / "online_hp_scenario_analysis_summary_notebook_10.csv"
+
+if not SUMMARY_CSV.exists():
+    raise FileNotFoundError(f"Run Part 4B first. Missing {SUMMARY_CSV}")
+
+df_sum = pd.read_csv(SUMMARY_CSV)
+if df_sum.empty:
+    raise ValueError("Scenario summary CSV is empty.")
+
+# -----------------------------
+# Billing config + plant
+# -----------------------------
+billing_cfg = load_billing_config(str(PROJECT_ROOT / "config" / "billing.yaml"))
+
+plant_path = PROJECT_ROOT / "data" / "plant1.csv"
+plant = pd.read_csv(plant_path)
+plant_ts = pd.to_datetime(plant["timestamp"], utc=True, errors="coerce")
+plant["timestamp"] = plant_ts.dt.tz_convert("Europe/Brussels").dt.tz_localize(None)
+plant = plant.sort_values("timestamp").reset_index(drop=True)
+plant = plant[(plant["timestamp"] >= pd.Timestamp("2025-01-01")) & (plant["timestamp"] < pd.Timestamp("2026-01-01"))].copy()
+
+# -----------------------------
+# Baseline (same as Part 3.2)
+# -----------------------------
+uncontrolled_hp_path = PROJECT_ROOT / "output" / "uncontrolled_hp.csv"
+if not uncontrolled_hp_path.exists():
+    raise FileNotFoundError(
+        f"Baseline uncontrolled HP not found at {uncontrolled_hp_path}. Run notebook 03 uncontrolled HP generation first."
+    )
+
+hp_un = pd.read_csv(uncontrolled_hp_path)
+
+plant_seq_b = plant[["timestamp", "inflex_load", "ev", "pv_production", "price", "grid_consumption", "thermal_load", "outdoor_temperature"]].copy().reset_index(drop=True)
+hp_seq = hp_un[["hp_electrical_load"]].rename(columns={"hp_electrical_load": "hp_kwh"}).copy().reset_index(drop=True)
+
+n_b = min(len(plant_seq_b), len(hp_seq))
+plant_seq_b = plant_seq_b.iloc[:n_b].copy()
+hp_seq = hp_seq.iloc[:n_b].copy()
+
+df_base = pd.concat([plant_seq_b, hp_seq], axis=1)
+
+net_kwh_base = (
+    df_base["inflex_load"].fillna(0.0)
+    + df_base["ev"].fillna(0.0)
+    + df_base["hp_kwh"].fillna(0.0)
+    - df_base["pv_production"].fillna(0.0)
+)
+
+df_base["grid_consumption_with_hp"] = net_kwh_base.clip(lower=0.0)
+df_base["grid_injection_with_hp"] = (-net_kwh_base).clip(lower=0.0)
+
+_naive = pd.to_datetime(
+    df_base["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S"),
+    format="%Y-%m-%d %H:%M:%S",
+)
+df_base["month"] = _naive.dt.to_period("M")
+
+# Access power from §1.2 (baseline HP = grid cummax + margin + HP @ -10°C)
+if "ACCESS_POWER_BASELINE_MONTHLY" not in globals():
+    raise RuntimeError("Run §1.2 first to build ACCESS_POWER_BASELINE_MONTHLY.")
+
+df_base["month_key"] = df_base["month"].astype(str)
+df_base["access_kw"] = df_base["month_key"].map(ACCESS_POWER_BASELINE_MONTHLY.to_dict()).astype(float)
+
+df_base["grid_consumption"] = df_base["grid_consumption_with_hp"]
+df_base["grid_injection"] = df_base["grid_injection_with_hp"]
+
+a_base = calculate_monthly_bills(
+    df_base,
+    billing_cfg,
+    volume_col="grid_consumption",
+    price_col="price",
+    timestamp_col="timestamp",
+    access_power_col="access_kw",
+)
+inj_base = calculate_monthly_injection_bills(
+    df_base,
+    billing_cfg,
+    injection_col="grid_injection",
+    price_col="price",
+    timestamp_col="timestamp",
+)
+
+# Annual baseline component totals
+base_energy = float(a_base["energy_cost_eur"].sum())
+base_spot = float(a_base["spot_cost_eur"].sum())
+base_access = float(a_base["access_cost_eur"].sum())
+base_monthly_peak = float(a_base["monthly_peak_cost_eur"].sum())
+base_over_usage = float(a_base["over_usage_cost_eur"].sum())
+base_inj_rev = float(inj_base["injection_net_revenue_eur"].sum())
+
+baseline_net = float(a_base["total_cost_eur"].sum() - base_inj_rev)
+
+# -----------------------------
+# Deterministic annual component totals (from NB03 exports)
+# -----------------------------
+DET_HP_BILLS_PATH = NOTEBOOKS_OUTPUT_DIR / "deterministic_hp_monthly_bills_notebook_03.csv"
+DET_HP_INJ_PATH = NOTEBOOKS_OUTPUT_DIR / "deterministic_hp_monthly_injection_notebook_03.csv"
+if not DET_HP_BILLS_PATH.exists() or not DET_HP_INJ_PATH.exists():
+    raise FileNotFoundError(
+        "Missing deterministic HP exports from notebook 03. Expected:\n"
+        f"- {DET_HP_BILLS_PATH}\n"
+        f"- {DET_HP_INJ_PATH}\n"
+    )
+
+det_bills = pd.read_csv(DET_HP_BILLS_PATH)
+det_inj = pd.read_csv(DET_HP_INJ_PATH)
+
+det_energy = float(det_bills["energy_cost_eur"].sum())
+det_spot = float(det_bills["spot_cost_eur"].sum())
+det_access = float(det_bills["access_cost_eur"].sum())
+det_monthly_peak = float(det_bills["monthly_peak_cost_eur"].sum())
+det_over_usage = float(det_bills["over_usage_cost_eur"].sum())
+det_inj_rev = float(det_inj["injection_net_revenue_eur"].sum())
+
+deterministic_net = float(det_bills["total_cost_eur"].sum() - det_inj_rev)
+
+# -----------------------------
+# Online scenario annual component totals (recompute from per-scenario 15-min CSV)
+# -----------------------------
+
+def _online_components_from_results_csv(results_csv_path: Path) -> dict:
+    res = pd.read_csv(results_csv_path)
+    plant_seq = plant[["timestamp", "inflex_load", "ev", "pv_production", "price", "outdoor_temperature"]].copy().reset_index(drop=True)
+    res_seq = res[["hp_applied_kwh", "access_kw"]].copy().reset_index(drop=True)
+    n = min(len(plant_seq), len(res_seq))
+    plant_seq = plant_seq.iloc[:n].copy()
+    res_seq = res_seq.iloc[:n].copy()
+    df_online = pd.concat([plant_seq, res_seq], axis=1)
+
+    net_kwh_online = (
+        df_online["inflex_load"].fillna(0.0)
+        + df_online["ev"].fillna(0.0)
+        + df_online["hp_applied_kwh"].fillna(0.0)
+        - df_online["pv_production"].fillna(0.0)
+    )
+    df_online["grid_consumption"] = net_kwh_online.clip(lower=0.0)
+    df_online["grid_injection"] = (-net_kwh_online).clip(lower=0.0)
+
+    bills = calculate_monthly_bills(
+        df_online,
+        billing_cfg,
+        volume_col="grid_consumption",
+        price_col="price",
+        timestamp_col="timestamp",
+        access_power_col="access_kw",
+    )
+    inj = calculate_monthly_injection_bills(
+        df_online,
+        billing_cfg,
+        injection_col="grid_injection",
+        price_col="price",
+        timestamp_col="timestamp",
+    )
+
+    energy = float(bills["energy_cost_eur"].sum())
+    spot = float(bills["spot_cost_eur"].sum())
+    access = float(bills["access_cost_eur"].sum())
+    monthly_peak = float(bills["monthly_peak_cost_eur"].sum())
+    over_usage = float(bills["over_usage_cost_eur"].sum())
+    inj_rev = float(inj["injection_net_revenue_eur"].sum())
+    net = float(bills["total_cost_eur"].sum() - inj_rev)
+
+    return {
+        "energy": energy,
+        "spot": spot,
+        "access": access,
+        "monthly_peak": monthly_peak,
+        "over_usage": over_usage,
+        "inj_rev": inj_rev,
+        "net": net,
+    }
+
+# -----------------------------
+# Build stacked savings bars (all vs baseline)
+# -----------------------------
+labels = ["Deterministic"]
+
+energy_sav = [base_energy - det_energy]
+spot_sav = [base_spot - det_spot]
+access_sav = [base_access - det_access]
+monthly_peak_sav = [base_monthly_peak - det_monthly_peak]
+over_usage_sav = [base_over_usage - det_over_usage]
+# Revenue: positive means scenario earns *more* revenue than baseline (reduces net cost)
+inj_rev_sav = [det_inj_rev - base_inj_rev]
+
+rows_print = []
+rows_print.append(("Baseline", baseline_net, 0.0))
+rows_print.append(("Deterministic", deterministic_net, baseline_net - deterministic_net))
+
+for _, row in df_sum.iterrows():
+    err_val = row.get("error", "")
+    has_error = (not pd.isna(err_val)) and bool(str(err_val).strip())
+    if has_error:
+        continue
+
+    res_path = Path(str(row["results_15min_path"]))
+    if not res_path.exists():
+        res_path = NOTEBOOKS_OUTPUT_DIR / Path(str(row["results_15min_path"])).name
+    if not res_path.exists():
+        print(f"WARNING: scenario results CSV not found: {row['results_15min_path']}")
+        continue
+
+    comps = _online_components_from_results_csv(res_path)
+
+    sid = row.get("scenario_id", "")
+    name = row.get("scenario_name", sid)
+    labels.append(f"S{sid}\n{name}")
+
+    energy_sav.append(base_energy - comps["energy"])
+    spot_sav.append(base_spot - comps["spot"])
+    access_sav.append(base_access - comps["access"])
+    monthly_peak_sav.append(base_monthly_peak - comps["monthly_peak"])
+    over_usage_sav.append(base_over_usage - comps["over_usage"])
+    inj_rev_sav.append(comps["inj_rev"] - base_inj_rev)
+
+    rows_print.append((f"S{sid} {name}", comps["net"], baseline_net - comps["net"]))
+
+# -----------------------------
+# Plot: total annual net savings (no stacking)
+# -----------------------------
+
+# Reconstruct net costs aligned with `labels`
+net_costs = [float(deterministic_net)]
+for _name, net, _sav in rows_print[2:]:
+    net_costs.append(float(net))
+net_costs = net_costs[: len(labels)]
+
+total_savings = baseline_net - np.array(net_costs, dtype=float)
+
+x = np.arange(len(labels))
+fig, ax = plt.subplots(figsize=(max(10, 1.4 * len(labels)), 5.5))
+ax.bar(x, total_savings, color="tab:blue", alpha=0.85)
+ax.axhline(0.0, color="black", linewidth=0.8)
+ax.set_xticks(x)
+ax.set_xticklabels(labels, rotation=25, ha="right")
+ax.set_ylabel("Savings vs baseline (EUR / year)")
+ax.set_title("Annual net savings vs baseline")
+ax.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print("\nScenarios (annual net + savings vs baseline):")
+for name, net, sav in rows_print:
+    print(f"- {name}: net={net:,.2f} EUR, savings={sav:,.2f} EUR")
+
+# -----------------------------
+# Table: Savings vs baseline (components x option columns)
+# -----------------------------
+
+comp_series = {
+    "Energy": np.array(energy_sav, dtype=float),
+    "Spot": np.array(spot_sav, dtype=float),
+    "Access power": np.array(access_sav, dtype=float),
+    "Monthly peak": np.array(monthly_peak_sav, dtype=float),
+    "Over-usage": np.array(over_usage_sav, dtype=float),
+    "Injection revenue Δ": np.array(inj_rev_sav, dtype=float),
+}
+
+table = pd.DataFrame(
+    {
+        "Energy": comp_series["Energy"],
+        "Spot": comp_series["Spot"],
+        "Access power": comp_series["Access power"],
+        "Monthly peak": comp_series["Monthly peak"],
+        "Over-usage": comp_series["Over-usage"],
+        "Injection revenue Δ": comp_series["Injection revenue Δ"],
+        "Total savings": total_savings,
+    },
+    index=labels,
+).T
+
+print("\nSavings vs baseline (EUR / year)")
+display(table.style.format("{:,.2f}"))

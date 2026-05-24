@@ -1,0 +1,907 @@
+# Part 4.3 — One-cell “all plots” for a selected slack (recreates 3.1 + 3.2 outputs)
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -----------------------
+# Settings (edit these)
+# -----------------------
+SLACK_SELECT_MIN = 90          # 0..90 step 15
+WEEK_NUMBER = 6               # (1..52), weeks starting Monday
+day_of_week = 2                # 1..7 (day inside the selected week)
+MPC_HOUR = 12                  # for the MPC window plot
+MPC_MINUTE = 30
+
+# -----------------------
+# Paths / imports
+# -----------------------
+PROJECT_ROOT = Path("..").resolve()
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.append(str(SRC_DIR))
+from billing import load_billing_config, calculate_monthly_bills, calculate_monthly_injection_bills
+# Per-slack exports from slack sensitivity (recommended)
+online_15min_path = (
+    PROJECT_ROOT
+    / "output"
+    / "notebooks"
+    / f"online_ev_15min_notebook_09_{int(SLACK_SELECT_MIN)}_min_slack.csv"
+)
+debug_csv_path = (
+    PROJECT_ROOT
+    / "output"
+    / "notebooks"
+    / f"online_ev_mpc_debug_notebook_09_{int(SLACK_SELECT_MIN)}_min_slack.csv"
+)
+# Deterministic exports (unchanged)
+det_15min_path = PROJECT_ROOT / "output" / "notebooks" / "deterministic_ev_15min_notebook_02.csv"
+det_monthly_path = PROJECT_ROOT / "output" / "notebooks" / "deterministic_ev_monthly_notebook_02.csv"
+billing_cfg_path = PROJECT_ROOT / "config" / "billing.yaml"
+for p in [online_15min_path, debug_csv_path, det_15min_path, det_monthly_path, billing_cfg_path]:
+    if not p.exists():
+        raise FileNotFoundError(f"Missing required file: {p}")
+
+# -----------------------
+# Load selected slack results (15-min)
+# -----------------------
+combined_path = PROJECT_ROOT / "output" / "notebooks" / "online_ev_15min_notebook_09_slack_sensitivity.csv"
+_all = pd.read_csv(combined_path)
+if "slack_min" not in _all.columns:
+    raise KeyError(f"Combined CSV missing 'slack_min': {combined_path}")
+
+results_df = _all[_all["slack_min"].astype(int) == int(SLACK_SELECT_MIN)].copy()
+if results_df.empty:
+    raise ValueError(
+        f"No rows for slack_min={SLACK_SELECT_MIN}. Available: {sorted(_all['slack_min'].unique())}"
+    )
+
+results_df["timestamp"] = pd.to_datetime(results_df["timestamp"], errors="raise")
+results_df = results_df.sort_values("timestamp").reset_index(drop=True)
+
+_diag_cols = ["was_clipped", "ev_enforce_deferred", "ev_envelope_headroom_after_kwh"]
+_missing_diag = [c for c in _diag_cols if c not in results_df.columns]
+if _missing_diag:
+    raise KeyError(
+        f"Slack results missing columns {_missing_diag}. "
+        "Re-run Part 4.1 (sensitivity) after updating src/online_MPC_1_EV.py."
+    )
+
+# -----------------------
+# Load deterministic exports
+# -----------------------
+DET_EV_15MIN = pd.read_csv(det_15min_path)
+DET_EV_15MIN["timestamp"] = pd.to_datetime(DET_EV_15MIN["timestamp"], errors="raise")
+DET_EV_15MIN = DET_EV_15MIN.sort_values("timestamp").reset_index(drop=True)
+
+DET_EV_MONTHLY = pd.read_csv(det_monthly_path)
+if "month" in DET_EV_MONTHLY.columns:
+    DET_EV_MONTHLY["month"] = pd.PeriodIndex(DET_EV_MONTHLY["month"], freq="M")
+
+# -----------------------
+# Derived columns for 3.1 plots
+# -----------------------
+_dt_hours = results_df["timestamp"].diff().dt.total_seconds().median() / 3600.0
+if not np.isfinite(_dt_hours) or _dt_hours <= 0:
+    raise ValueError("Failed to infer timestep from results_df timestamps.")
+
+# Online EV power in kW (15-min kWh -> kW)
+if "ev_online_mpc" not in results_df.columns:
+    raise KeyError("Online results must contain 'ev_online_mpc' (kWh per 15-min).")
+results_df["ev_power_kw_online"] = results_df["ev_online_mpc"] / float(_dt_hours)
+
+# -----------------------
+# 3.1 — Volumes plots (weekly, daily, MPC window, yearly)
+# -----------------------
+print(f"[Part 4.3] Using slack_min={SLACK_SELECT_MIN} | dt={_dt_hours:.3f} h")
+
+# --- Top 5 highest grid_consumption peaks (online MPC, kW) ---
+if "grid_consumption" in results_df.columns:
+    _peaks = results_df[["timestamp", "grid_consumption"]].copy()
+    _peaks["grid_consumption_kw"] = pd.to_numeric(_peaks["grid_consumption"], errors="coerce") * 4.0
+    top5_peaks_online = (
+        _peaks.dropna(subset=["grid_consumption_kw"])
+        .sort_values("grid_consumption_kw", ascending=False)
+        .head(5)
+        .reset_index(drop=True)
+    )
+    print("Top 5 highest grid_consumption peaks (online MPC, kW):")
+    display(top5_peaks_online[["timestamp", "grid_consumption_kw"]])
+else:
+    print("Column 'grid_consumption' not found in online results; cannot compute peaks.")
+
+# --- Week/day selection ---
+year_start = pd.Timestamp("2025-01-01 00:00:00")
+first_monday = year_start
+while first_monday.weekday() != 0:
+    first_monday += pd.Timedelta(days=1)
+
+start_week = first_monday + pd.Timedelta(days=(WEEK_NUMBER - 1) * 7)
+end_week = start_week + pd.Timedelta(days=7)
+
+selected_day_start = start_week + pd.Timedelta(days=int(day_of_week) - 1)
+selected_day_end = selected_day_start + pd.Timedelta(days=1)
+
+print(f"Visualizing week {WEEK_NUMBER}: {start_week:%Y-%m-%d} to {end_week:%Y-%m-%d}")
+print(f"Selected day {day_of_week}: {selected_day_start:%Y-%m-%d}")
+
+week_data = results_df[(results_df["timestamp"] >= start_week) & (results_df["timestamp"] < end_week)].copy()
+week_det = DET_EV_15MIN[(DET_EV_15MIN["timestamp"] >= start_week) & (DET_EV_15MIN["timestamp"] < end_week)].copy()
+
+# Deterministic remaining energy per time step (kWh)
+week_det["date"] = week_det["timestamp"].dt.date
+daily_det_demand = week_det.groupby("date")["ev_demand_actual"].transform("sum")
+week_det["det_charged_cum_kwh"] = week_det.groupby("date")["ev_charge"].cumsum()
+week_det["det_remaining_kwh"] = daily_det_demand - week_det["det_charged_cum_kwh"]
+
+_week_merge = week_data.merge(
+    week_det[
+        ["timestamp", "ev_demand_actual", "ev_charge_power", "ev_power_envelope", "det_remaining_kwh"]
+    ],
+    on="timestamp",
+    how="left",
+)
+
+fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+
+ax1.step(_week_merge["timestamp"], _week_merge["ev_demand_actual"] * 4.0, label="Uncontrolled EV demand",
+         color="tab:gray", linewidth=1.5, where="post")
+ax1.step(_week_merge["timestamp"], _week_merge["ev_charge_power"], label="Deterministic EV power",
+         color="tab:green", linewidth=2, where="post")
+ax1.step(_week_merge["timestamp"], _week_merge["ev_power_kw_online"], label="Online MPC EV power",
+         color="tab:blue", linewidth=2, where="post")
+ax1.step(_week_merge["timestamp"], _week_merge["ev_power_envelope"], label="Deterministic EV envelope",
+         color="tab:orange", linewidth=1.5, linestyle="--", where="post")
+ax1.set_ylabel("Power (kW)", fontweight="bold")
+ax1.set_title(f"EV Charging Power - Week {WEEK_NUMBER} (slack={SLACK_SELECT_MIN} min)", fontweight="bold")
+
+if "ev_enforce_active" in _day_merge.columns:
+    _enf = _day_merge[_day_merge["ev_enforce_active"] > 0.5]
+    if len(_enf):
+        ax1.scatter(
+            _enf["timestamp"],
+            _enf["ev_power_kw_online"],
+            s=40,
+            c="red",
+            zorder=5,
+            label="Enforce active",
+        )
+if "ev_enforce_deferred" in _day_merge.columns:
+    _def = _day_merge[_day_merge["ev_enforce_deferred"] > 0.5]
+    if len(_def):
+        ax1.scatter(
+            _def["timestamp"],
+            _def["ev_power_kw_online"],
+            s=40,
+            c="gold",
+            zorder=5,
+            label="Enforce deferred",
+        )
+
+ax1.legend(loc="upper left")
+ax1.grid(True, alpha=0.3)
+
+ax2.plot(_week_merge["timestamp"], _week_merge["price"], label="Spot price", color="purple", linewidth=1)
+ax2.set_ylabel("Spot Price", fontweight="bold")
+ax2.set_title("Electricity Spot Price", fontweight="bold")
+ax2.legend(loc="upper left")
+ax2.grid(True, alpha=0.3)
+
+# Remaining EV energy, with EV window markers
+first_label = True
+for d in pd.date_range(start_week, end_week - pd.Timedelta(days=1), freq="D"):
+    if d.weekday() < 5:
+        start_block = d.replace(hour=7, minute=0, second=0)
+        end_block = d.replace(hour=17, minute=0, second=0)
+        label = "EV charging window (07:00–17:00, weekdays)" if first_label else None
+        first_label = False
+        ax3.axvline(start_block, color="red", linestyle="--", linewidth=1.5, alpha=0.9, label=label)
+        ax3.axvline(end_block, color="red", linestyle="--", linewidth=1.5, alpha=0.9)
+
+ax3.plot(_week_merge["timestamp"], _week_merge["det_remaining_kwh"], label="Deterministic remaining (kWh)",
+         color="tab:green", linewidth=2)
+ax3.plot(_week_merge["timestamp"], _week_merge["ev_to_deliver_kwh"], label="Online remaining (kWh)",
+         color="tab:blue", linewidth=2, linestyle="--")
+if "ev_envelope_remaining_kwh" in _week_merge.columns:
+    ax3.plot(_week_merge["timestamp"], _week_merge["ev_envelope_remaining_kwh"],
+             label="Envelope headroom to 17:00 (kWh)", color="tab:orange", linewidth=1.5, linestyle=":")
+ax3.set_ylabel("Remaining energy (kWh)", fontweight="bold")
+ax3.set_title("Remaining EV energy – deterministic vs online", fontweight="bold")
+ax3.legend(loc="upper right")
+ax3.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# --- Daily multi-plot (8 panels) ---
+day_data = results_df[(results_df["timestamp"] >= selected_day_start) & (results_df["timestamp"] < selected_day_end)].copy()
+day_det = DET_EV_15MIN[(DET_EV_15MIN["timestamp"] >= selected_day_start) & (DET_EV_15MIN["timestamp"] < selected_day_end)].copy()
+
+day_det["date"] = day_det["timestamp"].dt.date
+daily_det_demand = day_det.groupby("date")["ev_demand_actual"].transform("sum")
+day_det["det_charged_cum_kwh"] = day_det.groupby("date")["ev_charge"].cumsum()
+day_det["det_remaining_kwh"] = daily_det_demand - day_det["det_charged_cum_kwh"]
+
+_day_merge = day_data.merge(
+    day_det[
+        [
+            "timestamp",
+            "ev_demand_actual",
+            "ev_charge_power",
+            "ev_power_envelope",
+            "det_remaining_kwh",
+            "grid_power",
+            "grid_consumption",
+        ]
+    ],
+    on="timestamp",
+    how="left",
+)
+
+fig, axes = plt.subplots(8, 1, figsize=(16, 26), sharex=True)
+ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8 = axes
+
+x_start = selected_day_start.replace(hour=5, minute=0, second=0)
+x_end = selected_day_start.replace(hour=19, minute=0, second=0)
+
+start_line = selected_day_start.replace(hour=7, minute=0, second=0, microsecond=0)
+end_line = selected_day_start.replace(hour=17, minute=0, second=0, microsecond=0)
+
+axes_daily = [ax1, ax2, ax3, ax4, ax5, ax6, ax7]
+for ax in axes_daily:
+    ax.axvline(start_line, color="red", linestyle="--", linewidth=1.5, alpha=0.9,
+               label="EV window start (07:00)" if ax is axes_daily[0] else None)
+    ax.axvline(end_line, color="red", linestyle="--", linewidth=1.5, alpha=0.9,
+               label="EV window end (17:00)" if ax is axes_daily[0] else None)
+axes_daily[0].legend(loc="upper right")
+
+ax1.step(_day_merge["timestamp"], _day_merge["ev_demand_actual"] * 4.0, label="Uncontrolled EV demand (kW)",
+         color="red", linewidth=1.5, where="post")
+ax1.step(_day_merge["timestamp"], _day_merge["ev_charge_power"], label="Deterministic EV power (kW)",
+         color="tab:green", linewidth=2, where="post")
+ax1.step(_day_merge["timestamp"], _day_merge["ev_power_kw_online"], label="Online MPC EV power (kW)",
+         color="tab:blue", linewidth=2, where="post")
+ax1.step(_day_merge["timestamp"], _day_merge["ev_power_envelope"], label="Deterministic EV envelope (kW)",
+         color="tab:orange", linewidth=1.5, linestyle="--", where="post")
+ax1.set_ylabel("Power (kW)", fontweight="bold")
+ax1.set_title(f"[1] EV charging power (slack={SLACK_SELECT_MIN} min) — {selected_day_start:%Y-%m-%d}", fontweight="bold")
+if "was_clipped" in _day_merge.columns:
+    _clip = _day_merge[_day_merge["was_clipped"] > 0.5]
+    if len(_clip):
+        ax1.scatter(_clip["timestamp"], _clip["ev_power_kw_online"], s=35, c="black", marker="x", zorder=6, label="Clipped")
+if "ev_enforce_active" in _day_merge.columns:
+    _enf = _day_merge[_day_merge["ev_enforce_active"] > 0.5]
+    if len(_enf):
+        ax1.scatter(_enf["timestamp"], _enf["ev_power_kw_online"], s=40, c="red", zorder=5, label="Enforce active")
+if "ev_enforce_deferred" in _day_merge.columns:
+    _def = _day_merge[_day_merge["ev_enforce_deferred"] > 0.5]
+    if len(_def):
+        ax1.scatter(_def["timestamp"], _def["ev_power_kw_online"], s=40, c="gold", zorder=5, label="Enforce deferred")
+ax1.legend(loc="upper left")
+ax1.grid(True, alpha=0.3)
+
+# Remaining energy plot (with blended scalars)
+this_date = selected_day_start.date()
+daily_ev_actual_kwh = float(daily_det_demand.iloc[0]) if len(daily_det_demand) else np.nan
+daily_ev_forecast_kwh = float(_day_merge["ev_daily_demand_kwh"].iloc[0]) if "ev_daily_demand_kwh" in _day_merge.columns else np.nan
+
+tod_day = _day_merge["timestamp"].dt.hour + _day_merge["timestamp"].dt.minute / 60.0
+w_actual_day = np.zeros(len(_day_merge), dtype=float)
+w_actual_day[tod_day <= 7.0] = 0.0
+w_actual_day[tod_day >= 12.0] = 1.0
+mid_mask = (tod_day > 7.0) & (tod_day < 12.0)
+w_actual_day[mid_mask] = (tod_day[mid_mask] - 7.0) / 5.0
+
+daily_ev_blend_kwh = (1.0 - w_actual_day) * daily_ev_forecast_kwh + w_actual_day * daily_ev_actual_kwh
+ev_energy_step_kwh = _day_merge["ev_power_kw_online"] * float(_dt_hours)
+ev_charged_cum_kwh = ev_energy_step_kwh.cumsum()
+
+ax2.plot(_day_merge["timestamp"], _day_merge["det_remaining_kwh"], label="Deterministic remaining (kWh)",
+         color="tab:green", linewidth=2, marker="o", markersize=3)
+ax2.plot(_day_merge["timestamp"], _day_merge["ev_to_deliver_kwh"], label="Online remaining (kWh)",
+         color="tab:blue", linewidth=2, linestyle="--", marker="o", markersize=3)
+ax2.plot(_day_merge["timestamp"], np.full(len(_day_merge), daily_ev_forecast_kwh), label="Daily EV forecast (kWh)",
+         color="tab:blue", linewidth=1.5, linestyle=":")
+ax2.plot(_day_merge["timestamp"], np.full(len(_day_merge), daily_ev_actual_kwh), label="Daily EV actual (kWh)",
+         color="tab:red", linewidth=1.5, linestyle=":")
+ax2.plot(_day_merge["timestamp"], daily_ev_blend_kwh, label="Daily EV blended (kWh)",
+         color="tab:purple", linewidth=2, linestyle="-.")
+ax2.plot(_day_merge["timestamp"], ev_charged_cum_kwh, label="Online charged (cum, kWh)",
+         color="tab:orange", linewidth=1.8)
+
+if "ev_envelope_remaining_kwh" in _day_merge.columns:
+    ax2.plot(
+        _day_merge["timestamp"],
+        _day_merge["ev_envelope_remaining_kwh"],
+        label="Envelope headroom to 17:00 (kWh)",
+        color="tab:orange",
+        linewidth=1.5,
+        linestyle=":",
+    )
+if "ev_envelope_headroom_after_kwh" in _day_merge.columns:
+    ax2.plot(
+        _day_merge["timestamp"],
+        _day_merge["ev_envelope_headroom_after_kwh"],
+        label="Headroom after step (kWh)",
+        color="tab:cyan",
+        linewidth=1.2,
+        linestyle="-.",
+    )
+ax2.set_ylabel("Remaining (kWh)", fontweight="bold")
+ax2.set_title("[2] Remaining EV energy – deterministic vs online", fontweight="bold")
+ax2.legend(loc="lower left")
+ax2.grid(True, alpha=0.3)
+
+ax3.plot(_day_merge["timestamp"], _day_merge["price"], label="Spot price (€/MWh)",
+         color="purple", linewidth=1, marker="o", markersize=3)
+ax3.set_ylabel("Spot (€/MWh)", fontweight="bold")
+ax3.set_title("[3] Electricity spot price – day profile", fontweight="bold")
+ax3.legend(loc="upper left")
+ax3.grid(True, alpha=0.3)
+
+ax4.step(_day_merge["timestamp"], _day_merge["ev_plan_kwh"] / float(_dt_hours),
+         label="Planner EV power (kW) – ev_plan_kwh / Δt", color="tab:cyan", linewidth=2, where="post")
+ax4.step(_day_merge["timestamp"], _day_merge["ev_power_kw_online"],
+         label="Applied EV power (kW) – online MPC", color="tab:blue", linewidth=2, linestyle="--", where="post")
+ax4.set_ylabel("Power (kW)", fontweight="bold")
+ax4.set_title("[4] EV planner vs applied power", fontweight="bold")
+ax4.legend(loc="upper left")
+ax4.grid(True, alpha=0.3)
+
+ax5.step(_day_merge["timestamp"], _day_merge["p_grid_plan_kw"], label="Planned grid power (kW) – p_grid_plan_kw",
+         color="tab:cyan", linewidth=2, where="post")
+ax5.step(_day_merge["timestamp"], _day_merge["grid_power_online"], label="Actual grid power (kW) – grid_power_online",
+         color="tab:blue", linewidth=2, linestyle="--", where="post")
+ax5.step(_day_merge["timestamp"], _day_merge["p_limit_kw"], label="Clipping limit (kW) – p_limit_kw",
+         color="tab:red", linewidth=1.5, linestyle=":", where="post")
+ax5.set_ylabel("Power (kW)", fontweight="bold")
+ax5.set_title("[5] Grid power vs clipping limit", fontweight="bold")
+ax5.legend(loc="lower left")
+ax5.grid(True, alpha=0.3)
+
+ax6.step(_day_merge["timestamp"], _day_merge["access_kw"], label="Access power (kW) – access_kw",
+         color="tab:orange", linewidth=2, where="post")
+ax6.step(_day_merge["timestamp"], _day_merge["current_peak_opt_kw"], label="Planner optimal monthly peak (kW)",
+         color="tab:green", linewidth=2, linestyle="--", where="post")
+ax6.step(_day_merge["timestamp"], _day_merge["monthly_peak_so_far"], label="Historical monthly peak so far (kW)",
+         color="tab:gray", linewidth=1.5, where="post")
+ax6.set_ylabel("Power (kW)", fontweight="bold")
+ax6.set_title("[6] Access power and peak tracking", fontweight="bold")
+ax6.legend(loc="lower left")
+ax6.grid(True, alpha=0.3)
+
+base_excl_kw = pd.to_numeric(_day_merge.get("grid_consumption_excl_ev"), errors="coerce") * 4.0
+uncontrolled_total_kw = (
+    pd.to_numeric(_day_merge.get("grid_consumption_excl_ev"), errors="coerce")
+    + pd.to_numeric(_day_merge.get("ev_demand_actual"), errors="coerce")
+) * 4.0
+det_grid_kw = pd.to_numeric(_day_merge.get("grid_power"), errors="coerce")
+online_grid_kw = pd.to_numeric(_day_merge.get("grid_power_online"), errors="coerce")
+
+ax7.step(_day_merge["timestamp"], base_excl_kw, label="Baseline grid (excl. EV) – kW",
+         color="tab:gray", linewidth=1.5, where="post")
+ax7.step(_day_merge["timestamp"], uncontrolled_total_kw, label="Uncontrolled total grid – kW",
+         color="red", linewidth=1.5, alpha=0.85, where="post")
+ax7.step(_day_merge["timestamp"], det_grid_kw, label="Deterministic MPC grid power – kW",
+         color="tab:green", linewidth=2, where="post")
+ax7.step(_day_merge["timestamp"], online_grid_kw, label="Online MPC grid power – kW",
+         color="tab:blue", linewidth=2, linestyle="--", where="post")
+ax7.step(_day_merge["timestamp"], pd.to_numeric(_day_merge.get("p_grid_plan_kw"), errors="coerce"),
+         label="Online planner grid (p_grid_plan_kw)", color="tab:cyan", linewidth=1.5, alpha=0.8, where="post")
+ax7.step(_day_merge["timestamp"], pd.to_numeric(_day_merge.get("p_limit_kw"), errors="coerce"),
+         label="Limit (p_limit_kw)", color="tab:purple", linewidth=1.2, alpha=0.8, where="post")
+ax7.step(_day_merge["timestamp"], pd.to_numeric(_day_merge.get("access_kw"), errors="coerce"),
+         label="Access power (access_kw)", color="tab:orange", linewidth=1.2, alpha=0.8, where="post")
+ax7.set_ylabel("Grid (kW)", fontweight="bold")
+ax7.set_title("[7] Grid consumption / power comparison (selected day)", fontweight="bold")
+ax7.legend(loc="lower left", ncol=2, fontsize=9)
+ax7.grid(True, alpha=0.3)
+
+# Plot 8: MPC 24h window from debug CSV (if available)
+t_k = selected_day_start.replace(hour=MPC_HOUR, minute=MPC_MINUTE, second=0, microsecond=0)
+
+if not debug_csv_path.exists():
+    ax8.text(0.5, 0.5, f"MPC debug CSV not found at\n{debug_csv_path}", ha="center", va="center", transform=ax8.transAxes)
+    ax8.set_axis_off()
+else:
+    debug_df = pd.read_csv(debug_csv_path, parse_dates=["t_k", "timestamp_window"])
+    window_df = debug_df.loc[debug_df["t_k"] == t_k].sort_values("timestamp_window").reset_index(drop=True)
+
+    if window_df.empty:
+        ax8.text(0.5, 0.5, f"No MPC window found for t_k = {t_k}", ha="center", va="center", transform=ax8.transAxes)
+        ax8.set_axis_off()
+    else:
+        ts_win = window_df["timestamp_window"]
+
+        idx0 = results_df.index[results_df["timestamp"] == t_k]
+        if len(idx0) == 0:
+            ax8.text(0.5, 0.5, f"t_k = {t_k} not found in results_df", ha="center", va="center", transform=ax8.transAxes)
+            ax8.set_axis_off()
+        else:
+            idx0 = int(idx0[0])
+            idx1 = idx0 + len(window_df)
+
+            env_actual_kw = (
+                results_df["ev_power_envelope_base_kw"].iloc[idx0:idx1].to_numpy()
+                if "ev_power_envelope_base_kw" in results_df.columns
+                else np.full(len(ts_win), np.nan)
+            )
+            env_blend_kw = (
+                window_df["in_ev_power_envelope_fixed_kw"].astype(float).to_numpy()
+                if "in_ev_power_envelope_fixed_kw" in window_df.columns
+                else np.full(len(ts_win), np.nan)
+            )
+            env_forecast_kw = (
+                window_df["in_ev_power_envelope_forecast_kw"].astype(float).to_numpy()
+                if "in_ev_power_envelope_forecast_kw" in window_df.columns
+                else np.full(len(ts_win), np.nan)
+            )
+            env_mpc_kw = (
+                window_df["opt_ev_power_envelope_mpc"].astype(float).to_numpy()
+                if "opt_ev_power_envelope_mpc" in window_df.columns
+                else np.full(len(ts_win), np.nan)
+            )
+            p_ev_plan_kw = (
+                window_df["opt_ev_charge"].astype(float).to_numpy() * 4.0
+                if "opt_ev_charge" in window_df.columns
+                else np.full(len(ts_win), np.nan)
+            )
+
+            ax8.step(ts_win, p_ev_plan_kw, label="Planned EV power (kW)", color="C0", linewidth=2, where="post")
+            ax8.step(ts_win, env_actual_kw, label="Envelope – actual (kW)", color="C1", linestyle="--", where="post")
+            ax8.step(ts_win, env_forecast_kw, label="Envelope – forecast (kW)", color="C4", linestyle="--", where="post")
+            ax8.step(ts_win, env_blend_kw, label="Input blended envelope (kW)", color="C3", linestyle=":", where="post")
+            ax8.step(ts_win, env_mpc_kw, label="MPC hard-constraint envelope (kW)", color="C2", linestyle="-.", where="post")
+            ax8.axvline(t_k, color="k", linestyle=":", linewidth=1.5, label=f"t_k = {t_k:%H:%M}")
+
+            ax8.set_ylabel("Power (kW)", fontweight="bold")
+            ax8.set_title("[8] MPC 24h window at selected timestep", fontweight="bold")
+            ax8.legend(loc="best", fontsize=9)
+            ax8.grid(True, alpha=0.3)
+
+for ax in axes:
+    ax.set_xlim(x_start, x_end)
+
+plt.tight_layout()
+plt.show()
+
+# --- Yearly EV difference plot + yearly grid consumption plot ---
+year = 2025
+
+det_year = DET_EV_15MIN.copy()
+det_year = det_year[det_year["timestamp"].dt.year == year].set_index("timestamp")
+daily_demand_kwh = det_year["ev_demand_actual"].resample("D").sum()
+
+res_year = results_df.copy()
+res_year = res_year[res_year["timestamp"].dt.year == year].set_index("timestamp")
+
+daily_ev_online_kwh = res_year["ev_online_mpc"].resample("D").sum()
+all_days = daily_demand_kwh.index.union(daily_ev_online_kwh.index)
+daily_demand_kwh = daily_demand_kwh.reindex(all_days, fill_value=0.0)
+daily_ev_online_kwh = daily_ev_online_kwh.reindex(all_days, fill_value=0.0)
+daily_diff_kwh = daily_demand_kwh - daily_ev_online_kwh
+
+fig, ax = plt.subplots(1, 1, figsize=(16, 5))
+ax.bar(all_days, daily_diff_kwh.values, width=0.9, color="tab:blue", alpha=0.7,
+       label="Deterministic demand - Online delivered (kWh/day)")
+ax.axhline(0.0, color="black", linewidth=1.0)
+ax.set_title(f"Yearly overview ({year}) — daily EV energy difference (deterministic - online), slack={SLACK_SELECT_MIN} min",
+             fontweight="bold")
+ax.set_ylabel("Difference (kWh/day)", fontweight="bold")
+ax.set_xlabel("Date", fontweight="bold")
+ax.grid(True, axis="y", alpha=0.3)
+ax.legend(loc="upper left")
+plt.tight_layout()
+plt.show()
+
+gc_year = res_year.copy().sort_index()
+gc_year["grid_consumption_excl_ev_kw"] = pd.to_numeric(gc_year["grid_consumption_excl_ev"], errors="coerce") * 4.0
+gc_year["grid_consumption_online_kw"] = np.maximum(pd.to_numeric(gc_year["grid_power_online"], errors="coerce"), 0.0)
+
+max_gc_online_kw = gc_year["grid_consumption_online_kw"].max()
+max_gc_excl_kw = gc_year["grid_consumption_excl_ev_kw"].max()
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.plot(gc_year.index, gc_year["grid_consumption_online_kw"], label="grid_consumption with EV (online MPC)", alpha=0.7)
+ax.plot(gc_year.index, gc_year["grid_consumption_excl_ev_kw"], label="grid_consumption_excl_ev (no EV)", alpha=0.7)
+ax.axhline(max_gc_online_kw, color="tab:blue", linestyle="--", alpha=0.5,
+           label=f"max with EV (online MPC) = {max_gc_online_kw:.1f} kW")
+ax.axhline(max_gc_excl_kw, color="tab:red", linestyle="--", alpha=0.5,
+           label=f"max excl EV = {max_gc_excl_kw:.1f} kW")
+ax.set_title(f"Grid consumption – baseline vs online EV MPC ({year}), slack={SLACK_SELECT_MIN} min", fontweight="bold")
+ax.set_xlabel("Time")
+ax.set_ylabel("Grid power [kW]")
+ax.legend()
+ax.grid(True)
+plt.tight_layout()
+plt.show()
+
+# -----------------------
+# 3.2 — Bills plots (shadow billing + savings breakdown)
+# -----------------------
+billing_cfg = load_billing_config(str(billing_cfg_path))
+
+# Recompute online bills/injection for this selected slack run.
+# IMPORTANT: do NOT trust pre-exported grid_consumption/grid_injection in the combined
+# slack-sensitivity CSV (it can be inconsistent). Reconstruct from plant1.csv +
+# selected online EV profile (ev_online_mpc).
+plant_path = PROJECT_ROOT / "data" / "plant1.csv"
+plant = pd.read_csv(plant_path)
+ts_utc = pd.to_datetime(plant["timestamp"], utc=True, errors="coerce")
+plant["timestamp"] = ts_utc.dt.tz_convert("Europe/Brussels").dt.tz_localize(None)
+plant = plant.sort_values("timestamp").reset_index(drop=True)
+plant = plant[(plant["timestamp"] >= pd.Timestamp("2025-01-01")) & (plant["timestamp"] < pd.Timestamp("2026-01-01"))].copy()
+
+required_cols_online = {"timestamp", "ev_online_mpc", "access_kw"}
+missing_cols_online = sorted(list(required_cols_online - set(results_df.columns)))
+if missing_cols_online:
+    raise KeyError(f"Selected slack results missing required columns for billing reconstruction: {missing_cols_online}")
+
+_m = plant[["timestamp", "inflex_load", "pv_production", "price"]].merge(
+    results_df[["timestamp", "ev_online_mpc", "access_kw"]],
+    on="timestamp",
+    how="inner",
+)
+
+# Net grid energy per 15-min (kWh)
+_net_kwh = (
+    pd.to_numeric(_m["inflex_load"], errors="coerce").fillna(0.0)
+    + pd.to_numeric(_m["ev_online_mpc"], errors="coerce").fillna(0.0)
+    - pd.to_numeric(_m["pv_production"], errors="coerce").fillna(0.0)
+)
+_m["grid_consumption"] = _net_kwh.clip(lower=0.0)
+_m["grid_injection"] = (-_net_kwh).clip(lower=0.0)
+
+online_bills = calculate_monthly_bills(
+    _m,
+    billing_cfg,
+    volume_col="grid_consumption",
+    price_col="price",
+    timestamp_col="timestamp",
+    access_power_col="access_kw",
+)
+online_inj = calculate_monthly_injection_bills(
+    _m,
+    billing_cfg,
+    injection_col="grid_injection",
+    price_col="price",
+    timestamp_col="timestamp",
+)
+
+summary_ev_online = {"bills": online_bills, "injection_bills": online_inj}
+
+# Ensure §1.2 access table (Part 4.3 must not overwrite with online-bill access only)
+if "table" not in globals() or "access_power_flex_aware" not in table.index:
+    if "access_power_conservative_kw" not in globals() or "access_power_flex_aware_kw" not in globals():
+        raise NameError(
+            "Run §1.2 first to build `table`, `access_power_conservative_kw`, and `access_power_flex_aware_kw`."
+        )
+    table = pd.DataFrame(
+        {
+            "access_power_conservative": access_power_conservative_kw,
+            "access_power_flex_aware": access_power_flex_aware_kw,
+        }
+    ).T  # rows = access rule, columns = months (same as §1.2)
+
+monthly_det = DET_EV_MONTHLY.copy()
+monthly_det["month_key"] = monthly_det["month"].astype(str)
+
+online_bills_orig = summary_ev_online["bills"].copy()
+online_injection_orig = summary_ev_online["injection_bills"].copy()
+online_bills_orig["month_key"] = online_bills_orig["month"].astype(str)
+online_injection_orig["month_key"] = online_injection_orig["month"].astype(str)
+
+online_net_orig = online_bills_orig[["month_key", "total_cost_eur"]].merge(
+    online_injection_orig[["month_key", "injection_net_revenue_eur"]],
+    on="month_key",
+    how="left",
+)
+online_net_orig["online_net_cost_eur"] = (
+    online_net_orig["total_cost_eur"]
+    - online_net_orig["injection_net_revenue_eur"].fillna(0.0)
+)
+online_net_orig = online_net_orig.set_index("month_key")
+
+shadow = pd.DataFrame({"month_key": monthly_det["month_key"]}).set_index("month_key")
+shadow["baseline_net_cost_eur"] = monthly_det["baseline_net_cost_eur"].values
+shadow["deterministic_net_cost_eur"] = monthly_det["optimized_net_cost_eur"].values
+shadow["baseline_peak_kw"] = monthly_det["baseline_monthly_peak_kw"].values
+shadow["deterministic_peak_kw"] = monthly_det["optimized_monthly_peak_kw"].values
+shadow["baseline_access_kw"] = (
+    table.loc["access_power_conservative"]
+    .rename(index=lambda m: str(m))
+    .reindex(shadow.index)
+    .astype(float)
+    .values
+)
+shadow["deterministic_access_kw"] = monthly_det["optimized_access_power_kw"].values
+shadow["baseline_volume_mwh"] = monthly_det["baseline_volume_mwh"].values
+shadow["deterministic_volume_mwh"] = monthly_det["optimized_volume_mwh"].values
+shadow["ev_cost_baseline_eur"] = monthly_det["ev_cost_baseline_eur"].values
+shadow["ev_cost_deterministic_eur"] = monthly_det["ev_cost_optimized_eur"].values
+
+shadow["online_net_cost_eur"] = online_net_orig.loc[shadow.index, "online_net_cost_eur"].values
+shadow["online_peak_kw"] = online_bills_orig.set_index("month_key")["monthly_peak_kw"].reindex(shadow.index).values
+
+_online_access_series = (
+    ACCESS_POWER_ONLINE_MONTHLY.copy()
+    if "ACCESS_POWER_ONLINE_MONTHLY" in globals()
+    else table.loc["access_power_flex_aware"]
+)
+_online_access_series.index = _online_access_series.index.astype(str)
+shadow["online_access_kw"] = _online_access_series.reindex(shadow.index).astype(float).values
+shadow["online_volume_mwh"] = online_bills_orig.set_index("month_key")["volume_mwh"].reindex(shadow.index).values
+
+shadow["deterministic_savings_eur"] = shadow["baseline_net_cost_eur"] - shadow["deterministic_net_cost_eur"]
+shadow["online_savings_eur"] = shadow["baseline_net_cost_eur"] - shadow["online_net_cost_eur"]
+
+shadow_billing_08 = shadow.reset_index().rename(columns={"month_key": "month"})
+print("Shadow billing monthly comparison (first rows)")
+display(
+    shadow_billing_08[
+        [
+            "month",
+            "baseline_net_cost_eur",
+            "deterministic_net_cost_eur",
+            "online_net_cost_eur",
+            "deterministic_savings_eur",
+            "online_savings_eur",
+        ]
+    ].head()
+)
+
+# Component-wise cost comparison (same as your 3.2)
+baseline_total = monthly_det["baseline_net_cost_eur"].sum()
+
+online_net = online_bills_orig[["month_key", "total_cost_eur"]].merge(
+    online_injection_orig[["month_key", "injection_net_revenue_eur"]],
+    on="month_key",
+    how="left",
+)
+online_net["online_net_cost_eur"] = online_net["total_cost_eur"] - online_net["injection_net_revenue_eur"].fillna(0.0)
+online_total = online_net["online_net_cost_eur"].sum()
+
+baseline_energy = monthly_det["baseline_energy_cost_eur"].sum()
+online_energy = online_bills_orig["energy_cost_eur"].sum()
+
+baseline_spot = monthly_det["baseline_spot_cost_eur"].sum()
+online_spot = online_bills_orig["spot_cost_eur"].sum()
+
+baseline_access = monthly_det["baseline_access_cost_eur"].sum()
+online_access = online_bills_orig["access_cost_eur"].sum()
+
+baseline_peak = (
+    monthly_det["baseline_monthly_peak_cost_eur"].sum()
+    + monthly_det["baseline_over_usage_cost_eur"].sum()
+)
+online_peak = (
+    online_bills_orig["monthly_peak_cost_eur"].sum()
+    + online_bills_orig["over_usage_cost_eur"].sum()
+)
+
+baseline_injection = monthly_det["baseline_injection_net_revenue_eur"].sum()
+online_injection = online_injection_orig["injection_net_revenue_eur"].sum()
+
+print("=" * 80)
+print(f"COST COMPARISON (slack={SLACK_SELECT_MIN} min): BASELINE vs DETERMINISTIC vs ONLINE (recomputed)")
+print("=" * 80)
+print(
+    f"\n{'Cost Component':<30} "
+    f"{'Baseline (EUR)':>20} {'Deterministic (EUR)':>20} {'Online (EUR)':>20} "
+    f"{'Savings det (EUR)':>20} {'Savings online (EUR)':>22}"
+)
+print("-" * 122)
+
+components = [
+    ("Energy Cost", baseline_energy, monthly_det["optimized_energy_cost_eur"].sum(), online_energy),
+    ("Spot Cost", baseline_spot, monthly_det["optimized_spot_cost_eur"].sum(), online_spot),
+    ("Access Power Cost", baseline_access, monthly_det["optimized_access_cost_eur"].sum(), online_access),
+    ("Monthly Peak Cost", monthly_det["baseline_monthly_peak_cost_eur"].sum(), monthly_det["optimized_monthly_peak_cost_eur"].sum(),
+     online_bills_orig["monthly_peak_cost_eur"].sum()),
+    ("Over-usage Cost", monthly_det["baseline_over_usage_cost_eur"].sum(), monthly_det["optimized_over_usage_cost_eur"].sum(),
+     online_bills_orig["over_usage_cost_eur"].sum()),
+    ("Injection Revenue", -baseline_injection, -monthly_det["optimized_injection_net_revenue_eur"].sum(), -online_injection),
+]
+for name, base_val, det_val, online_val in components:
+    print(
+        f"{name:<30} "
+        f"{base_val:>20,.2f} {det_val:>20,.2f} {online_val:>20,.2f} "
+        f"{(base_val-det_val):>20,.2f} {(base_val-online_val):>22,.2f}"
+    )
+
+print("-" * 122)
+print(
+    f"{'TOTAL COST':<30} "
+    f"{baseline_total:>20,.2f} {monthly_det['optimized_net_cost_eur'].sum():>20,.2f} {online_total:>20,.2f} "
+    f"{baseline_total - monthly_det['optimized_net_cost_eur'].sum():>20,.2f} "
+    f"{baseline_total - online_total:>22,.2f}"
+)
+print("=" * 80)
+
+# Monthly peak + access bar plots (thesis style — monthly peak matches notebook 10)
+import matplotlib as mpl
+
+months_plot = monthly_det["month"].astype(str).tolist()
+x = np.arange(len(months_plot))
+width = 0.25
+_peak_base = monthly_det["baseline_monthly_peak_kw"].values
+_peak_off = monthly_det["optimized_monthly_peak_kw"].values
+_peak_on = shadow_billing_08["online_peak_kw"].values
+
+THESIS_STYLE = {
+    "font.family": "serif",
+    "font.size": 11,
+    "axes.labelsize": 11,
+    "axes.titlesize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.linewidth": 0.8,
+    "text.color": "black",
+    "axes.labelcolor": "black",
+    "xtick.color": "black",
+    "ytick.color": "black",
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "grid.linewidth": 0.6,
+    "lines.linewidth": 2.2,
+    "savefig.dpi": 300,
+}
+mpl.rcParams.update(THESIS_STYLE)
+C_BLACK = "#000000"
+C_KUL_RED = "#b30000"
+mpl.rcParams["hatch.color"] = C_BLACK
+
+fig_peak, ax_peak = plt.subplots(figsize=(10, 5))
+ax_peak.bar(
+    x - width,
+    _peak_base,
+    width,
+    label="Baseline monthly peak",
+    color=C_KUL_RED,
+    alpha=0.55,
+    edgecolor=C_KUL_RED,
+    linewidth=0.6,
+)
+ax_peak.bar(
+    x,
+    _peak_off,
+    width,
+    label="Offline monthly peak",
+    facecolor="white",
+    edgecolor=C_BLACK,
+    hatch="///",
+    linewidth=0.8,
+)
+ax_peak.bar(
+    x + width,
+    _peak_on,
+    width,
+    label="Online monthly peak",
+    color=C_BLACK,
+    alpha=0.5,
+    edgecolor=C_BLACK,
+    linewidth=0.6,
+)
+ax_peak.set_ylabel("kW")
+ax_peak.set_ylim(2000, 3000)
+ax_peak.set_title("Monthly peak power (2025)")
+ax_peak.set_xticks(x)
+ax_peak.set_xticklabels(months_plot, rotation=45, ha="right")
+ax_peak.set_xlim(-0.5, len(months_plot) - 0.5)
+ax_peak.margins(x=0)
+ax_peak.tick_params(axis="x", pad=4)
+ax_peak.set_xlabel("Month", labelpad=6)
+_peak_handles, _peak_labels = ax_peak.get_legend_handles_labels()
+ax_peak.legend(
+    _peak_handles,
+    _peak_labels,
+    loc="upper center",
+    bbox_to_anchor=(0.5, -0.22),
+    ncol=3,
+    frameon=False,
+)
+fig_peak.subplots_adjust(bottom=0.28, top=0.90)
+plt.show()
+
+fig_acc, ax_acc = plt.subplots(figsize=(10, 5))
+
+ax_acc.bar(x - width, shadow_billing_08["baseline_access_kw"], width, label="Baseline Access Power (§1.2 cons.)", color="orange", alpha=0.7)
+ax_acc.bar(x, monthly_det["optimized_access_power_kw"], width, label="Deterministic Access Power", color="tab:green", alpha=0.7)
+ax_acc.bar(x + width, shadow_billing_08["online_access_kw"], width, label="Online Access Power (flex-aware)", color="tab:blue", alpha=0.7)
+ax_acc.set_xlabel("Month")
+ax_acc.set_ylabel("Access Power (kW)")
+ax_acc.set_title(f"Access Power: Baseline vs Deterministic vs Online (slack={SLACK_SELECT_MIN} min)")
+ax_acc.set_xticks(x)
+ax_acc.set_xticklabels(months_plot, rotation=45, ha="right")
+ax_acc.legend()
+ax_acc.grid(True, alpha=0.3, axis="y")
+
+plt.tight_layout()
+plt.show()
+
+# Savings breakdown stacked bar plot (from your 3.2)
+base_spot = monthly_det["baseline_spot_cost_eur"]
+opt_spot = monthly_det["optimized_spot_cost_eur"]
+base_access = monthly_det["baseline_access_cost_eur"]
+opt_access = monthly_det["optimized_access_cost_eur"]
+base_peak = monthly_det["baseline_monthly_peak_cost_eur"] + monthly_det["baseline_over_usage_cost_eur"]
+opt_peak = monthly_det["optimized_monthly_peak_cost_eur"] + monthly_det["optimized_over_usage_cost_eur"]
+
+spot_savings_det = base_spot - opt_spot
+access_savings_det = base_access - opt_access
+peak_savings_det = base_peak - opt_peak
+
+online_idx = online_bills_orig.set_index("month_key")
+spot_online = online_idx.loc[monthly_det["month_key"], "spot_cost_eur"].values
+access_online = online_idx.loc[monthly_det["month_key"], "access_cost_eur"].values
+peak_online = (
+    online_idx.loc[monthly_det["month_key"], "monthly_peak_cost_eur"].values
+    + online_idx.loc[monthly_det["month_key"], "over_usage_cost_eur"].values
+)
+
+spot_savings_online = base_spot.values - spot_online
+access_savings_online = base_access.values - access_online
+peak_savings_online = base_peak.values - peak_online
+
+savings_dual = pd.DataFrame({
+    "month": monthly_det["month"],
+    "month_key": monthly_det["month_key"],
+    "spot_savings_det": spot_savings_det,
+    "access_power_savings_det": access_savings_det,
+    "peak_savings_det": peak_savings_det,
+    "spot_savings_online": spot_savings_online,
+    "access_power_savings_online": access_savings_online,
+    "peak_savings_online": peak_savings_online,
+})
+savings_dual["total_savings_det"] = savings_dual["spot_savings_det"] + savings_dual["access_power_savings_det"] + savings_dual["peak_savings_det"]
+savings_dual["total_savings_online"] = savings_dual["spot_savings_online"] + savings_dual["access_power_savings_online"] + savings_dual["peak_savings_online"]
+
+x = np.arange(len(savings_dual))
+width = 0.35
+fig, ax = plt.subplots(figsize=(16, 6))
+
+ax.bar(x - width/2, savings_dual["spot_savings_det"], width, label="Deterministic – Spot", color="tab:blue", alpha=0.8)
+ax.bar(x - width/2, savings_dual["access_power_savings_det"], width, bottom=savings_dual["spot_savings_det"],
+       label="Deterministic – Access power", color="tab:green", alpha=0.8)
+ax.bar(x - width/2, savings_dual["peak_savings_det"], width,
+       bottom=(savings_dual["spot_savings_det"] + savings_dual["access_power_savings_det"]),
+       label="Deterministic – Peak", color="tab:orange", alpha=0.8)
+
+ax.bar(x + width/2, savings_dual["spot_savings_online"], width, label="Online – Spot", color="tab:blue", alpha=0.4)
+ax.bar(x + width/2, savings_dual["access_power_savings_online"], width, bottom=savings_dual["spot_savings_online"],
+       label="Online – Access power", color="tab:green", alpha=0.4)
+ax.bar(x + width/2, savings_dual["peak_savings_online"], width,
+       bottom=(savings_dual["spot_savings_online"] + savings_dual["access_power_savings_online"]),
+       label="Online – Peak", color="tab:orange", alpha=0.4)
+
+ax.set_xlabel("Month", fontsize=12)
+ax.set_ylabel("Savings vs baseline (EUR)", fontsize=12, fontweight="bold")
+ax.set_title(f"Monthly savings breakdown vs baseline: Deterministic vs Online (slack={SLACK_SELECT_MIN} min)", fontsize=14, fontweight="bold")
+ax.set_xticks(x)
+ax.set_xticklabels(savings_dual["month"].astype(str), rotation=45, ha="right")
+ax.legend(loc="upper left", ncol=2)
+ax.grid(True, alpha=0.3, axis="y")
+plt.tight_layout()
+plt.show()
+
+print("\nSavings breakdown (first rows):")
+cols_show = [
+    "month",
+    "spot_savings_det",
+    "access_power_savings_det",
+    "peak_savings_det",
+    "total_savings_det",
+    "spot_savings_online",
+    "access_power_savings_online",
+    "peak_savings_online",
+    "total_savings_online",
+]
+display(savings_dual[cols_show].head())
+
+

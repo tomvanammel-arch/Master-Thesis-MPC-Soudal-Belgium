@@ -1,0 +1,21 @@
+## 4. Scenario analysis
+
+Batch HP online MPC runs over a grid of **forecast-stress SOC floor**, **inflex stress quantiles**, and **SOC floor strength** (same core wrapper as Part 2).
+
+| Part | Purpose | Access power |
+|------|---------|----------------|
+| **4A** | Define `SCENARIOS` (`HpOnlineScenario`) | — |
+| **4B** | Run full-year MPC per scenario (`RUN_SCENARIOS`) | §1.2 **flex-aware** (`ACCESS_POWER_DICT`) |
+| **4C** | Viewer: Part 3.1 + 3.2 plots for one export | flex online |
+| **4D** | Stacked savings vs baseline (all scenarios) | Baseline: §1.2 **conservative**; online: `access_kw` in each scenario CSV |
+
+**Prerequisites**
+
+- §1.2: `ACCESS_POWER_DICT` (month key `YYYY-MM` → kW).
+- Forecast CSVs + `config/hp.yaml` as in Part 2.
+- Notebook 03 exports for deterministic reference and Part 4C/4D comparisons.
+- `output/uncontrolled_hp.csv` for baseline net cost (same definition as Part 3.2).
+
+**Run order:** §1.2 → Part 2 (reference scenario) → set `RUN_SCENARIOS=True` in 4B only when recomputing the batch → 4C–4D.
+
+Rerunning 4B overwrites `online_hp_15min_notebook_10_scenario_*.csv` and `online_hp_scenario_analysis_summary_notebook_10.csv`.

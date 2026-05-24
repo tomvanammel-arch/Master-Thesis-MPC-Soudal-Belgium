@@ -1,0 +1,19 @@
+#Soudal shadow billing:
+Energy_based_costs:
+  imbalance_cost_eur_per_mwh: 5 # EUR/MWh indicative for NDA
+  guarantees_of_origin_eur_per_mwh: 3 # EUR/MWh indicative for NDA
+  chp_certificate_eur_per_mwh: 1.836 # EUR/MWh
+  green_energy_certificate_eur_per_mwh: 5.738 # EUR/MWh
+  grid_losses_percentage: 0.0175 # percent
+  odv_eur_per_mwh: 4.2294 # EUR/MWh
+  additional_costs_eur_per_mwh: 0.2249 # EUR/MWh
+  special_tax_eur_per_mwh: 10.762 # EUR/MWh
+
+Peak_based_costs:
+  monthly_peak_price_eur_per_kw: 4.2269465 # EUR/kW/month
+  access_power_price_eur_per_kw: 2.9975458 # EUR/kW/month
+  over_usage_price_eur_per_kw: 4.4963187 # EUR/kW/month
+  max_access_power_kw: 5000.0 # Maximum access power (kW) - Big-M constant for optimization constraints
+
+Injection_costs:
+  imbalance_cost_eur_per_mwh: 20 # EUR/MWh indicative for NDA

@@ -1,0 +1,39 @@
+# Heat Pump Configuration
+# Coefficient of Performance (COP) as a function of outdoor temperature
+# Data from heat pump datasheet: Clade Larch cascade heat pump model 350kW
+
+
+COP_data:
+  # Dictionary format: temperature (°C): COP value based on fixed regime supply temperature 70°C and return temperature 60°C.
+  # For interpolation: COP increases with outdoor temperature
+  "-10": 2.1
+  "-5": 2.2
+  "0": 2.32
+  "5": 2.43
+  "10": 2.55
+  "15": 2.62
+  "20": 2.73
+  "25": 2.84
+
+# Heat Pump Capacity
+capacity:
+  thermal_max_kw: 1000  # Maximum thermal output capacity (kW)
+
+# Thermal Buffer (Hot Water Storage Tank)
+buffer:
+  size_m3: 80 # Buffer size in cubic meters (m³)
+  water_density_kg_per_m3: 1000  # Water density (kg/m³)
+  soc_min: 0.2  # Minimum state of charge (fraction, 0-1)
+  soc_max: 0.95 # Maximum state of charge (fraction, 0-1)
+  soc_initial: 0.5  # Initial state of charge (fraction, 0-1)
+  soc_final: 0.5  # Terminal SOC target for MPC (fraction, 0-1)
+  cp_kj_per_kg_k: 4.18  # Specific heat capacity of water (kJ/(kg·K))
+  usable_delta_t_k: 10  # Usable temperature difference (K)
+  loss_coefficient_per_hour: 0.001  # Thermal loss coefficient per hour (fraction of SOC lost per hour)
+
+# Economic Parameters
+economics:
+  cost_of_capital: 0.05  # Cost of capital (discount rate) as fraction
+  buffer_lifetime_years: 25  # Buffer lifetime in years
+  buffer_capex_per_m3: 1400  # Installed cost per cubic meter (EUR/m³) https://www.thebiomasshut.co.uk/products/60000l-buffer-tank.html + 40% installation cost
+

@@ -1,0 +1,33 @@
+# Part 4.2 — Plot unmet energy vs slack, and online savings vs slack
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+PROJECT_ROOT = Path("..").resolve()
+summary_path = PROJECT_ROOT / "output" / "notebooks" / "online_ev_slack_sensitivity_summary_notebook_09.csv"
+if not summary_path.exists():
+    raise FileNotFoundError(f"Sensitivity summary not found: {summary_path}. Run Part 4.1 first.")
+
+sens = pd.read_csv(summary_path)
+sens = sens.sort_values("slack_min").reset_index(drop=True)
+
+fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+ax.plot(sens["slack_min"], sens["unmet_mwh"], marker="o")
+ax.set_title("Unmet EV energy (Online MPC) vs deadline slack")
+ax.set_xlabel("Slack (min)")
+ax.set_ylabel("Unmet energy (MWh/year)")
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+fig, ax = plt.subplots(1, 1, figsize=(9, 4))
+ax.plot(sens["slack_min"], sens["online_savings_vs_baseline_eur"], marker="o")
+ax.set_title("Online MPC savings vs baseline (net) vs deadline slack")
+ax.set_xlabel("Slack (min)")
+ax.set_ylabel("Savings vs baseline (EUR/year)")
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+display(sens)

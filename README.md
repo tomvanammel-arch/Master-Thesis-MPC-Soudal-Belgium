@@ -55,13 +55,11 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Install takes **10–30 minutes** (PyTorch is large). If `pywinpty` fails on macOS/Linux, skip it — it is only used for Windows terminal integration in Jupyter:
+Install takes **10–30 minutes** (PyTorch is large). If `pywinpty` fails on macOS/Linux, install without it (Windows-only Jupyter helper):
 
 ```bash
-pip install -r requirements.txt --ignore-installed pywinpty 2>/dev/null || pip install $(grep -v pywinpty requirements.txt | tr '\n' ' ')
+grep -v '^pywinpty' requirements.txt | pip install -r /dev/stdin
 ```
-
-Or install packages manually and omit `pywinpty` if pip errors on that line.
 
 ### 4. Select the Python interpreter in VS Code
 

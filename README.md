@@ -1,40 +1,147 @@
 # Master Thesis - MPC @ Soudal (EV + Heat Pump)
 
-This repository contains the code and notebooks used to **simulate and optimize industrial electricity consumption** under the **Belgian capacity tariff**. The core use-case is a site with:
+Code and notebooks to **simulate and optimize industrial electricity consumption** under the **Belgian capacity tariff** (EV charging + heat pump + buffer, with deterministic and online MPC).
 
-- **Inflexible electrical load** (plant baseline consumption)
-- **PV production**
-- **Uncontrolled EV charging demand** (treated as flexible in deterministic MPC, forecast-driven in online MPC)
-- **Thermal load** served by a **heat pump + hot-water buffer** (flexible via buffer SOC)
-
-The work is organised around two main experiment families:
-
-- **Deterministic MPC (perfect foresight for 2025)**: optimise a full year in one optimisation problem (EV-only, HP-only, EV+HP).
-- **Online MPC (rolling horizon with forecasts)**: simulate a year step-by-step using **24h rolling-horizon MPC** fed by forecasts, plus "real-time" post-processing (clipping / safeguards).
+Public repository: [github.com/tomvanammel-arch/Master-Thesis-MPC-Soudal-Belgium](https://github.com/tomvanammel-arch/Master-Thesis-MPC-Soudal-Belgium)
 
 ---
 
-## Quick start
+## Run the notebooks (start here)
 
-### Environment
+Follow these steps once, then run notebooks **01 → 11 in order**. Later notebooks read CSV outputs from earlier ones.
 
-The repo is Python-based (notebooks + `src/` modules).
+### 1. Prerequisites
 
-```bash
+| Requirement | Notes |
+|---|---|
+| **Python 3.12** | Tested on 3.12. Other 3.10+ versions may work; use 3.12 if you hit dependency issues. |
+| **Git** | To clone the repository. |
+| **VS Code** (recommended) | With extensions **Python** and **Jupyter** installed. |
+| **Disk space** | ~5 GB free (PyTorch + Chronos model cache). |
+| **Internet** | Needed for `pip install` and the first Chronos forecast run (Hugging Face model download). |
+| **Time** | Notebooks 01–04 and 05–08: tens of minutes each. Notebooks 09–11 (full-year online MPC): **several hours each**. |
+
+No API keys or external data downloads are required — all input CSVs are in `data/`.
+
+### 2. Clone and open in VS Code
+
+```powershell
+git clone https://github.com/tomvanammel-arch/Master-Thesis-MPC-Soudal-Belgium.git
+cd Master-Thesis-MPC-Soudal-Belgium
+code .
+```
+
+On macOS/Linux, replace the last line with your editor, or open the cloned folder via **File → Open Folder**.
+
+### 3. Create a virtual environment and install dependencies
+
+Open a terminal in VS Code (**Terminal → New Terminal**). The terminal should be at the **repository root** (you should see `config/`, `data/`, `notebooks/`, `src/`).
+
+**Windows (PowerShell):**
+
+```powershell
 python -m venv .venv
-.\.venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Run notebooks
-
-Start JupyterLab and run notebooks in numerical order:
+**macOS / Linux:**
 
 ```bash
-jupyter lab
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-The notebooks write intermediate and final artifacts to `output/` (see [Outputs](#outputs)).
+Install takes **10–30 minutes** (PyTorch is large). If `pywinpty` fails on macOS/Linux, skip it — it is only used for Windows terminal integration in Jupyter:
+
+```bash
+pip install -r requirements.txt --ignore-installed pywinpty 2>/dev/null || pip install $(grep -v pywinpty requirements.txt | tr '\n' ' ')
+```
+
+Or install packages manually and omit `pywinpty` if pip errors on that line.
+
+### 4. Select the Python interpreter in VS Code
+
+1. `Ctrl+Shift+P` → **Python: Select Interpreter**
+2. Choose **`.venv (Python 3.12.x)`** inside this project.
+
+The included `.vscode/settings.json` points VS Code at `.venv` and sets the notebook working directory correctly (see step 5).
+
+### 5. Open a notebook and check the kernel
+
+1. Open `notebooks/01_benchmark.ipynb`
+2. Top-right kernel picker → select **`.venv (Python 3.12.x)`**
+3. Run the first code cell.
+
+**Important — working directory:** notebooks load data via relative paths such as `../data/plant1.csv`. That assumes the **current working directory is `notebooks/`**, not the repo root. The repo ships `.vscode/settings.json` with:
+
+```json
+"jupyter.notebookFileRoot": "${fileDirname}"
+```
+
+If paths fail with *FileNotFoundError*, confirm this setting is active, re-open the notebook, and re-select the `.venv` kernel. Do **not** change paths to `data/plant1.csv` — keep the notebook folder as the reference point.
+
+### 6. Run notebooks in order
+
+Use **Run All** (or run cells top-to-bottom). Do not skip ahead — downstream notebooks expect files under `output/`.
+
+| Step | Notebook | What it produces (main artifacts) | Rough runtime |
+|---|---|---|---|
+| 1 | `01_benchmark.ipynb` | Validation plots; billing sanity checks | ~5 min |
+| 2 | `02_EV_deterministic_MPC.ipynb` | `output/optimised_ts/deterministic_ev.csv` | ~15–30 min |
+| 3 | `03_HP_deterministic_MPC.ipynb` | `output/optimised_ts/deterministic_hp.csv`, `output/uncontrolled_hp.csv` | ~15–30 min |
+| 4 | `04_EV+HP_deterministic_MPC.ipynb` | `output/optimised_ts/deterministic_ev_hp.csv` | ~20–40 min |
+| 5 | `05_forecasting_EV.ipynb` | `output/forecast/forecast_ev_rolling_horizon.csv` | ~30–60 min (Chronos) |
+| 6 | `06_forecasting_inflex_load.ipynb` | `output/forecast/forecast_inflex_load_rolling_horizon.csv` | ~30–60 min |
+| 7 | `07_forecasting_PV.ipynb` | `output/forecast/forecast_pv_rolling_horizon.csv` | ~30–60 min |
+| 8 | `08_forecasting_thermal_load.ipynb` | `output/forecast/forecast_thermal_load_rolling_horizon.csv` | ~30–60 min |
+| 9 | `09_online_MPC_1_EV.ipynb` | `output/notebooks/online_ev_15min_notebook_09.csv` | **hours** |
+| 10 | `10_online_MPC_1_HP.ipynb` | `output/notebooks/online_hp_15min_notebook_10_part2.csv` | **hours** |
+| 11 | `11_online_MPC_1_EV+HP.ipynb` | `output/notebooks/online_ev_hp_15min_notebook_11_part2.csv` | **hours** |
+
+Generated files go to `output/` (gitignored). If you delete `output/`, re-run from the notebook that creates the missing file.
+
+### 7. Quick smoke test (optional)
+
+After setup, verify imports and the optimisation solver before a long run:
+
+```powershell
+python -c "import pandas, pyomo, highspy; from pyomo.opt import SolverFactory; print('HiGHS available:', SolverFactory('highs').available())"
+```
+
+Expected: `HiGHS available: True`. If `False`, run `pip install highspy` inside the activated venv.
+
+### 8. Known issues when running from a fresh clone
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `FileNotFoundError` for `../data/...` | Notebook cwd is repo root | Enable `jupyter.notebookFileRoot` (step 5); reopen notebook |
+| `ModuleNotFoundError: src...` | Kernel not using `.venv` | Re-select interpreter (step 4) |
+| `HiGHS not available` | Solver not installed | `pip install highspy` |
+| Chronos cell hangs / fails first time | Model download | Wait; ensure internet; needs ~1–2 GB cache |
+| Notebook 09+ fails on missing CSV | Skipped forecasting step | Run notebooks 05–08 first |
+| `pip install` fails on `pywinpty` | macOS/Linux | Omit `pywinpty` (see step 3) |
+
+---
+
+## Project overview
+
+The core use-case is a site with:
+
+- **Inflexible electrical load** (plant baseline consumption)
+- **PV production**
+- **Uncontrolled EV charging demand** (flexible in deterministic MPC; forecast-driven in online MPC)
+- **Thermal load** served by a **heat pump + hot-water buffer** (flexible via buffer SOC)
+
+Two experiment families:
+
+- **Deterministic MPC (perfect foresight for 2025)**: optimise a full year in one problem (EV-only, HP-only, EV+HP) — notebooks **02–04**.
+- **Online MPC (rolling horizon with forecasts)**: 24h MPC every 15 minutes with clipping and safeguards — notebooks **09–11**.
+
+Forecasting notebooks **05–08** build the rolling-horizon inputs used by online MPC.
 
 ---
 
@@ -784,8 +891,6 @@ Below is a detailed "what and why" description for each notebook, focusing on th
 - `output/optimised_ts/online_ev_hp.csv`
 - Part 4: `output/notebooks/online_ev_hp_scenario_analysis_summary_notebook_11.csv`
 
-See [notebooks/readme/readme_notebook11_online_MPC_EV_HP.md](notebooks/readme/readme_notebook11_online_MPC_EV_HP.md).
-
 ---
 
 ### `notebooks/10_online_MPC_1_HP.ipynb` — Online HP-only MPC 1 (access power + simulation + comparison + scenarios)
@@ -829,34 +934,14 @@ See [notebooks/readme/readme_notebook11_online_MPC_EV_HP.md](notebooks/readme/re
 
 ---
 
-## Typical end-to-end workflow
-
-If you want to reproduce the full pipeline in a clean environment, a practical sequence is:
-
-1. Run `01_benchmark.ipynb` (data sanity and baseline understanding).
-2. Run deterministic notebooks:
-   - `02_EV_deterministic_MPC.ipynb`
-   - `03_HP_deterministic_MPC.ipynb`
-   - `04_EV+HP_deterministic_MPC.ipynb`
-3. Run forecasting notebooks to generate `output/forecast/*.csv`:
-   - `05_forecasting_EV.ipynb`
-   - `06_forecasting_inflex_load.ipynb`
-   - `07_forecasting_PV.ipynb`
-   - `08_forecasting_thermal_load.ipynb`
-4. Run online notebooks:
-   - `09_online_MPC_1_EV.ipynb`
-   - `10_online_MPC_1_HP.ipynb`
-   - `11_online_MPC_EV+HP.ipynb`
-
----
-
 ## Notes and gotchas
 
-- **Solvers**: optimisation is implemented in Pyomo (`src/optimization.py`) and needs a solver available in your environment. The repo includes `highspy` in `requirements.txt` (HiGHS), but your Pyomo solver backend still needs to be properly discoverable on your machine.
-- **Outputs are stateful**: many notebooks read CSVs produced by earlier notebooks. If you delete `output/`, re-run notebooks in the recommended order.
-- **Forecast strategies**: online MPC scripts expect column naming conventions such as:
+- **Solvers**: optimisation uses Pyomo (`src/optimization.py`) with **HiGHS** (`highspy` in `requirements.txt`). Run the smoke test in [step 7](#7-quick-smoke-test-optional) after install.
+- **Outputs are stateful**: many notebooks read CSVs from earlier steps. Re-run in order if you delete `output/`.
+- **Forecast column names** expected by online MPC scripts:
   - `forecast_ev_<strategy>`
   - `forecast_inflex_<strategy>`
   - `forecast_thermal_<strategy>`
   - `pv_forecast_kWh_15min_<strategy>`
+- **requirements.txt** is a full lockfile the author's Windows + Python 3.12 environment. It is complete but heavy; see [step 3](#3-create-a-virtual-environment-and-install-dependencies) for macOS/Linux notes.
 

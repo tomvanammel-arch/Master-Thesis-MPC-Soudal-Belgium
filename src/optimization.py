@@ -2179,6 +2179,7 @@ def deterministic_mpc_ev_hp(
     soc_min = hp_config['buffer']['soc_min']
     soc_max = hp_config['buffer']['soc_max']
     soc_initial = hp_config['buffer']['soc_initial']
+    soc_final = float(hp_config['buffer'].get('soc_final', soc_initial))
     loss_coefficient_per_hour = hp_config['buffer']['loss_coefficient_per_hour']
     
     # Calculate buffer capacity in kWh from physical parameters
@@ -2190,6 +2191,7 @@ def deterministic_mpc_ev_hp(
     print(f"     - Buffer capacity: {buffer_capacity_kwh:.2f} kWh (calculated)")
     print(f"     - SOC limits: {soc_min:.2f} - {soc_max:.2f}")
     print(f"     - Initial SOC: {soc_initial:.2f}")
+    print(f"     - Terminal SOC target: {soc_final:.2f}")
     
     # Prepare data
     print(f"\n[3/11] Preparing input data...")
@@ -2505,6 +2507,11 @@ def deterministic_mpc_ev_hp(
     
     model.buffer_state_update = Constraint(model.T, rule=buffer_state_update)
     print(f"   ✓ Buffer state update constraint added")
+
+    # Terminal SOC target (hard constraint): end of year SOC equals configured target.
+    # Matches deterministic_mpc_hp (notebook 03) for comparable full-year closure.
+    model.terminal_soc = Constraint(expr=model.buffer_soc[n_periods - 1] == soc_final)
+    print(f"   ✓ Terminal SOC constraint added (SOC_end = SOC_final = {soc_final:.2f})")
     
     # Combined Power Balance: Grid_consumption - Grid_injection = Inflex_load + EV_charge + HP_electrical_input - PV_production
     def power_balance(model, t):

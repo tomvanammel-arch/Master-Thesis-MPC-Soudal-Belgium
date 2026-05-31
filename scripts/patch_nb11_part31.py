@@ -28,7 +28,7 @@ Joint **online MPC** (Part 2) vs **deterministic joint** (notebook 04) vs baseli
 
 1. SOC violation summary (online + deterministic)
 2. **Weekly** (4 thesis figures): EV power; HP electrical; buffer SOC; grid power (nb09/nb10 style; forecast-stress shading when Part 2 export includes it)
-3. **Daily** (4 thesis figures, 05:00–19:00): EV power (+ enforce markers), HP electrical, buffer SOC, grid power
+3. **Daily** (5 thesis figures, 05:00–19:00): EV power, HP electrical, buffer SOC, electricity spot price (ZOH), grid power
 4. **Yearly**: daily uncharged EV; daily EV delivered (online vs det.); full-year grid comparison
 5. Optional **MPC 24h window** at `DEBUG_TS` when `RUN_MPC_DEBUG=True` (requires §1.2 + forecasts)
 """

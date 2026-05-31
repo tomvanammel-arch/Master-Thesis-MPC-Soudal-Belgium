@@ -33,6 +33,7 @@ from notebook_visualisation.nb09_ev_part34_viewer import (
     apply_thesis_rc,
     baseline_ev_kw,
     plot_thesis_day_ev_power,
+    plot_thesis_day_spot_price,
 )
 
 _LAB_HP_BASELINE = "HP power (baseline)"
@@ -516,7 +517,7 @@ def plot_thesis_volume_suite_day(
     show_enforce_markers: bool = True,
     xlim: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
 ) -> None:
-    """All four thesis day figures for Part 4C."""
+    """All five thesis day figures for Part 4C (spot price below buffer SOC)."""
     plot_thesis_day_ev_power_joint(
         day_df,
         day_start,
@@ -527,4 +528,9 @@ def plot_thesis_volume_suite_day(
     plot_thesis_day_buffer_soc(
         day_df, day_det, day_start, soc_min=soc_min, soc_max=soc_max, xlim=xlim
     )
+    _spot_df = day_df
+    if "price" not in _spot_df.columns and "spot_price" in _spot_df.columns:
+        _spot_df = day_df.copy()
+        _spot_df["price"] = _spot_df["spot_price"]
+    plot_thesis_day_spot_price(_spot_df, day_start, xlim=xlim)
     plot_thesis_day_grid_power_joint(day_df, day_start, xlim=xlim)

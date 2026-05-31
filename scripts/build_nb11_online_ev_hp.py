@@ -905,7 +905,7 @@ _plant_path = PROJECT_ROOT / "data" / "plant1.csv"
 if _plant_path.exists():
     _plant_need = [
         c
-        for c in ("grid_consumption", "grid_consumption_excl_ev")
+        for c in ("grid_consumption", "grid_consumption_excl_ev", "price")
         if c not in res_plot.columns
     ]
     if _plant_need:

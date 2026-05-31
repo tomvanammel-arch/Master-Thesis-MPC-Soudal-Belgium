@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Literal, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,11 @@ if str(THIS_DIR) not in sys.path:
 
 from optimization import mpc_hp_24h  # type: ignore
 from heat_pump_load import load_hp_config, interpolate_cop  # type: ignore
+from billing import (  # type: ignore
+    load_billing_config,
+    calculate_monthly_bills,
+    calculate_monthly_injection_bills,
+)
 
 
 def _parse_plant_data(plant_path: Path) -> pd.DataFrame:
@@ -66,6 +71,74 @@ def _month_key(ts: pd.Timestamp) -> str:
     return ts.to_period("M").strftime("%Y-%m")
 
 
+def _apply_hp_soc_bounds(
+    hp_applied_kwh: float,
+    soc: float,
+    thermal_demand_kwh_th: float,
+    cop_k: float,
+    buffer_capacity_kwh_th: float,
+    loss_rate_per_interval: float,
+    soc_min_phys: float,
+    soc_max_phys: float,
+    enforce_soc_min: bool,
+    enforce_soc_max: bool,
+) -> Dict[str, float]:
+    """Apply physical SOC max (reduce HP) and SOC min PLC (add HP) after a nominal HP setpoint."""
+    buffer_energy_prev = soc * buffer_capacity_kwh_th
+    losses_kwh = buffer_energy_prev * loss_rate_per_interval
+    thermal_served_kwh_th = thermal_demand_kwh_th
+    unmet_thermal_kwh_th = 0.0
+    plc_extra_kwh = 0.0
+    plc_active = 0.0
+
+    hp_thermal_out_kwh = hp_applied_kwh * cop_k
+    soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
+
+    if enforce_soc_max and soc_next_raw > soc_max_phys:
+        if cop_k > 1e-9:
+            hp_cap_kwh = (
+                (soc_max_phys - soc) * buffer_capacity_kwh_th
+                + thermal_demand_kwh_th
+                + losses_kwh
+            ) / cop_k
+        else:
+            hp_cap_kwh = 0.0
+        hp_applied_kwh = float(max(min(hp_applied_kwh, hp_cap_kwh), 0.0))
+        hp_thermal_out_kwh = hp_applied_kwh * cop_k
+        soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
+
+    if enforce_soc_min and soc_next_raw < soc_min_phys:
+        deficit_kwh_th = (soc_min_phys - soc_next_raw) * buffer_capacity_kwh_th
+        extra_kwh_el = deficit_kwh_th / cop_k if cop_k > 1e-9 else 0.0
+        if extra_kwh_el > 0.0:
+            plc_extra_kwh = float(extra_kwh_el)
+            plc_active = 1.0
+            hp_applied_kwh = float(hp_applied_kwh + extra_kwh_el)
+            hp_thermal_out_kwh = hp_applied_kwh * cop_k
+            soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
+    elif (not enforce_soc_min) and soc_next_raw < soc_min_phys:
+        served_max = (
+            hp_thermal_out_kwh
+            - losses_kwh
+            + (soc - soc_min_phys) * buffer_capacity_kwh_th
+        )
+        thermal_served_kwh_th = float(
+            min(thermal_demand_kwh_th, max(0.0, served_max))
+        )
+        unmet_thermal_kwh_th = float(max(thermal_demand_kwh_th - thermal_served_kwh_th, 0.0))
+        soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
+        soc_next_raw = float(max(soc_next_raw, soc_min_phys))
+
+    return {
+        "hp_applied_kwh": float(hp_applied_kwh),
+        "plc_extra_kwh": plc_extra_kwh,
+        "plc_active": plc_active,
+        "thermal_served_kwh_th": thermal_served_kwh_th,
+        "unmet_thermal_kwh_th": unmet_thermal_kwh_th,
+        "soc_next_raw": float(soc_next_raw),
+    }
+
+
 def run_hp_online_mpc_1(
     forecast_strategy_inflex: str = "c",
     forecast_strategy_inflex_stress: Optional[str] = None,
@@ -86,6 +159,7 @@ def run_hp_online_mpc_1(
     enable_mpc_window_debug: bool = False,
     enable_forecast_stress_soc_floor: bool = False,
     forecast_stress_soc_floor_strength: float = 1.0,
+    actuator_mode: Literal["full", "planner_only_soc_bounds"] = "full",
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Run a full-year HP-only online myopic MPC simulation (24h rolling horizon).
@@ -102,7 +176,17 @@ def run_hp_online_mpc_1(
     sliced into each 24h MPC window; the optimizer sees upcoming stress periods in advance.
     PLC and unmet-thermal paths always use soc_min_phys so the buffer can discharge to the physical
     minimum after clipping.
+
+    ``actuator_mode="planner_only_soc_bounds"`` (Part 5): same planner loop but skips Eq. (3.50)
+    clip, access cap, and forecast-stress SOC floor; only physical SOC bounds (0.2 / 0.95) are enforced.
     """
+    planner_only = actuator_mode == "planner_only_soc_bounds"
+    if planner_only:
+        enable_forecast_stress_soc_floor = False
+        enable_mpc_window_debug = False
+        enforce_soc_min = True
+        enforce_soc_max = True
+
     plant_path = PROJECT_ROOT / "data" / "plant1.csv"
     forecast_inflex_path = PROJECT_ROOT / "output" / "forecast" / "forecast_inflex_load_rolling_horizon.csv"
     forecast_ev_path = PROJECT_ROOT / "output" / "forecast" / "forecast_ev_rolling_horizon.csv"
@@ -154,7 +238,10 @@ def run_hp_online_mpc_1(
         print(f"  Temperature forecast:  {temperature_forecast_path}", flush=True)
         print(f"  Billing config:        {billing_path}", flush=True)
         print(f"  HP config:             {hp_config_path}", flush=True)
+        print(f"  Actuator mode:         {actuator_mode}", flush=True)
         print("-" * 80, flush=True)
+
+    billing_cfg = load_billing_config(str(billing_path))
 
     plant_df = _parse_plant_data(plant_path)
     n = len(plant_df)
@@ -561,121 +648,95 @@ def run_hp_online_mpc_1(
         p_grid_plan_kw = 4.0 * (inflex_act_kwh + ev_act_kwh + hp_plan_kwh - pv_act_kwh)
         p_grid_plan_kw_ts[k] = p_grid_plan_kw
 
-        # Real-time peak limit (thesis Eq. 3.50; aligned with online_MPC_1_EV)
-        p_target_kw = monthly_peak_plan_kw
-        inner = max(peak_sofar_kw, p_target_kw)
-        p_limit = min(access_kw, inner) if access_kw > 0 else inner
-        p_limit_kw_ts[k] = p_limit
-        grid_clip_limit_kw_ts[k] = p_limit
-
-        was_clipped = p_grid_plan_kw > p_limit
-        was_clipped_ts[k] = 1.0 if was_clipped else 0.0
-
-        if not was_clipped:
-            hp_new_kw = hp_plan_kw
-        else:
-            delta_p = p_grid_plan_kw - p_limit
-            hp_new_kw = max(hp_plan_kw - delta_p, 0.0)
-
-        hp_applied_kwh = hp_new_kw / 4.0
-        hp_applied_kwh_nominal_ts[k] = hp_applied_kwh
-        plc_extra_kwh = 0.0
-        plc_active = 0.0
-        hp_applied_kwh_ts[k] = hp_applied_kwh
-
-        # Buffer SOC update using actual thermal load and actual COP at k
         thermal_demand_kwh_th = float(plant_df["thermal_load"].iloc[k])
         temp_act = float(plant_df["outdoor_temperature"].iloc[k])
         cop_k = float(interpolate_cop(temp_act, hp_cfg["COP_data"])) if not np.isnan(temp_act) else 2.5
 
-        buffer_energy_prev = soc * buffer_capacity_kwh_th
-        losses_kwh = buffer_energy_prev * loss_rate_per_interval
-        thermal_served_kwh_th = thermal_demand_kwh_th
-        unmet_thermal_kwh_th = 0.0
-
-        # ------------------------------------------------------------------
-        # Access-aware actuator (always on):
-        # Reduce HP to avoid p_grid_actual_kw > access_kw when possible,
-        # but prioritize physical SOC-min (soc_min_phys). If meeting SOC-min
-        # requires exceeding access, we allow the exceedance.
-        # ------------------------------------------------------------------
-        hp_access_cap_kwh = (float(access_kw) / 4.0) - (inflex_act_kwh + ev_act_kwh - pv_act_kwh)
-        hp_access_cap_kwh = float(max(hp_access_cap_kwh, 0.0))
-        if cop_k > 1e-9:
-            hp_socmin_req_kwh = (
-                (soc_min_phys - soc) * buffer_capacity_kwh_th
-                + thermal_demand_kwh_th
-                + losses_kwh
-            ) / cop_k
+        if planner_only:
+            p_limit_kw_ts[k] = np.nan
+            grid_clip_limit_kw_ts[k] = np.nan
+            was_clipped_ts[k] = 0.0
+            hp_applied_kwh = hp_plan_kwh
+            hp_applied_kwh_nominal_ts[k] = hp_applied_kwh
+            soc_out = _apply_hp_soc_bounds(
+                hp_applied_kwh=hp_applied_kwh,
+                soc=soc,
+                thermal_demand_kwh_th=thermal_demand_kwh_th,
+                cop_k=cop_k,
+                buffer_capacity_kwh_th=buffer_capacity_kwh_th,
+                loss_rate_per_interval=loss_rate_per_interval,
+                soc_min_phys=soc_min_phys,
+                soc_max_phys=soc_max_phys,
+                enforce_soc_min=enforce_soc_min,
+                enforce_soc_max=enforce_soc_max,
+            )
         else:
-            hp_socmin_req_kwh = 0.0
-        hp_socmin_req_kwh = float(max(hp_socmin_req_kwh, 0.0))
+            # Real-time peak limit (thesis Eq. 3.50; aligned with online_MPC_1_EV)
+            p_target_kw = monthly_peak_plan_kw
+            inner = max(peak_sofar_kw, p_target_kw)
+            p_limit = min(access_kw, inner) if access_kw > 0 else inner
+            p_limit_kw_ts[k] = p_limit
+            grid_clip_limit_kw_ts[k] = p_limit
 
-        hp_applied_kwh = float(
-            max(hp_socmin_req_kwh, min(hp_applied_kwh, hp_access_cap_kwh))
-        )
-        hp_new_kw = 4.0 * hp_applied_kwh
+            was_clipped = p_grid_plan_kw > p_limit
+            was_clipped_ts[k] = 1.0 if was_clipped else 0.0
 
-        hp_thermal_out_kwh = hp_applied_kwh * cop_k
-        soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
-        soc_after_raw_ts[k] = soc_next_raw
+            if not was_clipped:
+                hp_new_kw = hp_plan_kw
+            else:
+                delta_p = p_grid_plan_kw - p_limit
+                hp_new_kw = max(hp_plan_kw - delta_p, 0.0)
 
-        # SOC-max safeguard: if SOC would exceed physical maximum, reduce HP to meet SOC_max_phys.
-        if enforce_soc_max and soc_next_raw > soc_max_phys:
-            # Solve for hp_applied_kwh such that soc_next_raw == soc_max_phys:
-            # soc_max_phys = soc + (hp_applied_kwh * cop_k - thermal_act_kwh - losses_kwh) / Cb
-            # => hp_applied_kwh = ((soc_max_phys - soc)*Cb + thermal_act_kwh + losses_kwh) / cop_k
+            hp_applied_kwh = hp_new_kw / 4.0
+            hp_applied_kwh_nominal_ts[k] = hp_applied_kwh
+
+            # Access-aware actuator: cap grid at access when possible, but allow exceedance for SOC-min.
+            hp_access_cap_kwh = (float(access_kw) / 4.0) - (inflex_act_kwh + ev_act_kwh - pv_act_kwh)
+            hp_access_cap_kwh = float(max(hp_access_cap_kwh, 0.0))
+            buffer_energy_prev = soc * buffer_capacity_kwh_th
+            losses_kwh = buffer_energy_prev * loss_rate_per_interval
             if cop_k > 1e-9:
-                hp_cap_kwh = (
-                    (soc_max_phys - soc) * buffer_capacity_kwh_th
+                hp_socmin_req_kwh = (
+                    (soc_min_phys - soc) * buffer_capacity_kwh_th
                     + thermal_demand_kwh_th
                     + losses_kwh
                 ) / cop_k
             else:
-                hp_cap_kwh = 0.0
-            hp_applied_kwh = float(max(min(hp_applied_kwh, hp_cap_kwh), 0.0))
-            hp_new_kw = 4.0 * hp_applied_kwh
-            hp_thermal_out_kwh = hp_applied_kwh * cop_k
-            soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
-            soc_after_raw_ts[k] = soc_next_raw
+                hp_socmin_req_kwh = 0.0
+            hp_socmin_req_kwh = float(max(hp_socmin_req_kwh, 0.0))
 
-        # SOC-min / unmet: use physical SOC min only so the buffer can discharge to soc_min_phys after clipping (PLC does not enforce the planner stress floor).
-        if enforce_soc_min and soc_next_raw < soc_min_phys:
-            deficit_kwh_th = (soc_min_phys - soc_next_raw) * buffer_capacity_kwh_th
-            extra_kwh_el = deficit_kwh_th / cop_k if cop_k > 1e-9 else 0.0
-            if extra_kwh_el > 0.0:
-                plc_extra_kwh = float(extra_kwh_el)
-                plc_active = 1.0
-                hp_applied_kwh = float(hp_applied_kwh + extra_kwh_el)
-                hp_new_kw = 4.0 * hp_applied_kwh
-                # Recompute thermal output and raw SOC after PLC action
-                hp_thermal_out_kwh = hp_applied_kwh * cop_k
-                soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
-                soc_after_raw_ts[k] = soc_next_raw
-        elif (not enforce_soc_min) and soc_next_raw < soc_min_phys:
-            # If we do NOT enforce SOC-min by adding HP energy, keep SOC >= soc_min_phys by allowing unmet thermal demand.
-            served_max = (
-                hp_thermal_out_kwh
-                - losses_kwh
-                + (soc - soc_min_phys) * buffer_capacity_kwh_th
+            hp_applied_kwh = float(
+                max(hp_socmin_req_kwh, min(hp_applied_kwh, hp_access_cap_kwh))
             )
-            thermal_served_kwh_th = float(
-                min(thermal_demand_kwh_th, max(0.0, served_max))
-            )
-            unmet_thermal_kwh_th = float(max(thermal_demand_kwh_th - thermal_served_kwh_th, 0.0))
-            soc_next_raw = soc + (hp_thermal_out_kwh - thermal_served_kwh_th - losses_kwh) / buffer_capacity_kwh_th
-            # Guard against numerical noise:
-            soc_next_raw = float(max(soc_next_raw, soc_min_phys))
-            soc_after_raw_ts[k] = soc_next_raw
 
-        # Final applied signal (includes PLC safeguard)
+            soc_out = _apply_hp_soc_bounds(
+                hp_applied_kwh=hp_applied_kwh,
+                soc=soc,
+                thermal_demand_kwh_th=thermal_demand_kwh_th,
+                cop_k=cop_k,
+                buffer_capacity_kwh_th=buffer_capacity_kwh_th,
+                loss_rate_per_interval=loss_rate_per_interval,
+                soc_min_phys=soc_min_phys,
+                soc_max_phys=soc_max_phys,
+                enforce_soc_min=enforce_soc_min,
+                enforce_soc_max=enforce_soc_max,
+            )
+
+        hp_applied_kwh = soc_out["hp_applied_kwh"]
+        plc_extra_kwh = soc_out["plc_extra_kwh"]
+        plc_active = soc_out["plc_active"]
+        thermal_served_kwh_th = soc_out["thermal_served_kwh_th"]
+        unmet_thermal_kwh_th = soc_out["unmet_thermal_kwh_th"]
+        soc_next_raw = soc_out["soc_next_raw"]
+        soc_after_raw_ts[k] = soc_next_raw
+
         hp_plc_extra_kwh_ts[k] = plc_extra_kwh
         plc_active_ts[k] = plc_active
         hp_applied_kwh_ts[k] = hp_applied_kwh
         thermal_served_kwh_th_ts[k] = thermal_served_kwh_th
         unmet_thermal_kwh_th_ts[k] = unmet_thermal_kwh_th
 
-        # Actual grid power after clipping + PLC safeguard (may exceed access power if safeguard needed)
+        # Actual grid power after actuator (may exceed access if PLC needed)
         p_grid_act_kw = 4.0 * (inflex_act_kwh + ev_act_kwh + hp_applied_kwh - pv_act_kwh)
         p_grid_actual_kw_ts[k] = p_grid_act_kw
 
@@ -718,6 +779,28 @@ def run_hp_online_mpc_1(
         }
     )
 
+    res_for_billing = res.copy()
+    res_for_billing["price"] = plant_df["price"].to_numpy()
+    res_for_billing["grid_consumption"] = np.maximum(res["p_grid_actual_kw"], 0.0) / 4.0
+    res_for_billing["grid_injection"] = np.maximum(-res["p_grid_actual_kw"], 0.0) / 4.0
+    res_for_billing["month_key"] = res_for_billing["timestamp"].apply(_month_key)
+    res_for_billing["access_power_online_kw"] = res_for_billing["month_key"].map(access_power_by_month)
+    if res_for_billing["access_power_online_kw"].isna().any():
+        bad_months = sorted(
+            set(res_for_billing.loc[res_for_billing["access_power_online_kw"].isna(), "month_key"])
+        )
+        raise KeyError(
+            "access_power_by_month is missing entries for months in billing: "
+            + ", ".join(bad_months)
+        )
+
+    bills = calculate_monthly_bills(
+        res_for_billing,
+        billing_cfg,
+        access_power_col="access_power_online_kw",
+    )
+    inj_bills = calculate_monthly_injection_bills(res_for_billing, billing_cfg)
+
     summary = {
         "monthly_peak_so_far": dict(monthly_peak_so_far),
         "soc_min_phys": float(soc_min_phys),
@@ -735,6 +818,54 @@ def run_hp_online_mpc_1(
         "monthly_peak_price_multiplier": float(monthly_peak_price_multiplier),
         "enable_forecast_stress_soc_floor": bool(enable_forecast_stress_soc_floor),
         "forecast_stress_soc_floor_strength": float(forecast_stress_soc_floor_strength),
+        "bills": bills,
+        "injection_bills": inj_bills,
+        "actuator_mode": actuator_mode,
+        "thesis_steps": "0,1,2,6 + SOC bounds" if planner_only else "0-6",
     }
     return res, summary
 
+
+def run_hp_online_mpc_planner_only(
+    forecast_strategy_inflex: str = "c",
+    forecast_strategy_pv: str = "actual",
+    forecast_strategy_thermal: str = "c",
+    forecast_strategy_ev: str = "actual",
+    forecast_strategy_temperature: str = "actual",
+    access_power_by_month: Dict[str, float] = None,
+    hp_config_path: Optional[str] = None,
+    soc_slack_penalty_eur_per_soc: Optional[float] = None,
+    soc_min_slack_penalty_eur_per_soc: float = 1.0e6,
+    monthly_peak_price_multiplier: float = 1.0,
+    verbose: bool = True,
+    log_prefix: str = "[Planner-only MPC]",
+    horizon_len: int = 96,
+) -> Tuple[pd.DataFrame, Dict]:
+    """Full-year HP online MPC with planner + physical SOC bounds only (no clip / access cap / stress floor)."""
+    return run_hp_online_mpc_1(
+        forecast_strategy_inflex=forecast_strategy_inflex,
+        forecast_strategy_pv=forecast_strategy_pv,
+        forecast_strategy_thermal=forecast_strategy_thermal,
+        forecast_strategy_ev=forecast_strategy_ev,
+        forecast_strategy_temperature=forecast_strategy_temperature,
+        access_power_by_month=access_power_by_month,
+        hp_config_path=hp_config_path,
+        enforce_soc_min=True,
+        enforce_soc_max=True,
+        soc_slack_penalty_eur_per_soc=soc_slack_penalty_eur_per_soc,
+        soc_min_slack_penalty_eur_per_soc=soc_min_slack_penalty_eur_per_soc,
+        monthly_peak_price_multiplier=monthly_peak_price_multiplier,
+        verbose=verbose,
+        log_prefix=log_prefix,
+        horizon_len=horizon_len,
+        enable_mpc_window_debug=False,
+        enable_forecast_stress_soc_floor=False,
+        actuator_mode="planner_only_soc_bounds",
+    )
+
+
+if __name__ == "__main__":
+    raise RuntimeError(
+        "CLI entry point is disabled. Call run_hp_online_mpc_1 from a notebook or script "
+        "and provide 'access_power_by_month' explicitly."
+    )

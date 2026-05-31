@@ -1,5 +1,5 @@
 """
-Notebook 09 Part 4.3 thesis-style day plots (EV power, grid power).
+Notebook 09 Part 4.3 thesis-style day plots (EV power, grid power, spot price).
 Aligned with nb10 §4C day figures in nb10_hp_part34_viewer.py.
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from typing import Any
 import matplotlib as mpl
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 THESIS_STYLE: dict[str, Any] = {
@@ -35,6 +36,7 @@ THESIS_STYLE: dict[str, Any] = {
 
 C_ONLINE = "#b30000"
 C_OFFLINE = "#000000"
+C_BLACK = "#000000"
 C_BASELINE = "#2166ac"
 C_ACCESS = "#444444"
 C_STRESS = "#c8d8e8"
@@ -53,6 +55,8 @@ _LAB_GRID_BASELINE = "Grid power (baseline)"
 _LAB_GRID_ONLINE = "Grid power (online)"
 _LAB_GRID_OFFLINE = "Grid power (offline)"
 _LAB_GRID_ACCESS = "Access power (online)"
+
+_LAB_SPOT = "Spot price (€/MWh)"
 
 
 def apply_thesis_rc() -> None:
@@ -150,6 +154,17 @@ def baseline_grid_kw(day_df: pd.DataFrame) -> pd.Series:
     excl = pd.to_numeric(day_df.get("grid_consumption_excl_ev"), errors="coerce").fillna(0.0)
     ev = pd.to_numeric(day_df.get("ev_demand_actual"), errors="coerce").fillna(0.0)
     return (excl + ev) * 4.0
+
+
+def spot_price_eur_per_mwh(day_df: pd.DataFrame) -> pd.Series:
+    """Day-ahead spot price (€/MWh) from ``price``, ``spot_price_eur_per_mwh``, or ``spot_price``."""
+    for col in ("spot_price_eur_per_mwh", "price", "spot_price"):
+        if col in day_df.columns:
+            return pd.to_numeric(day_df[col], errors="coerce")
+    raise KeyError(
+        "Day frame missing spot price column (expected one of: "
+        "spot_price_eur_per_mwh, price, spot_price)"
+    )
 
 
 def _enforce_markers(ax, day_df: pd.DataFrame) -> None:
@@ -328,6 +343,48 @@ def plot_thesis_day_grid_power(
     return ax
 
 
+def plot_thesis_day_spot_price(
+    day_df: pd.DataFrame,
+    day_start: pd.Timestamp,
+    *,
+    ax=None,
+    standalone: bool = True,
+    title: str | None = None,
+    xlim: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+) -> plt.Axes:
+    """Electricity spot price (€/MWh), nb10 thesis day style."""
+    apply_thesis_rc()
+    day_title = day_start.strftime("%d/%m/%Y")
+    created_fig = None
+    if ax is None:
+        created_fig, ax = plt.subplots(figsize=(10, 4.2))
+    elif standalone:
+        created_fig = ax.figure
+
+    if xlim is None and standalone:
+        xlim = _day_view_xlim(day_start)
+
+    ts = day_df["timestamp"]
+    _zoh(
+        ax,
+        ts,
+        spot_price_eur_per_mwh(day_df),
+        color=C_BASELINE,
+        linestyle=LS_ONLINE,
+        label=_LAB_SPOT,
+    )
+
+    ax.set_ylabel("€/MWh")
+    ax.set_xlabel("Time")
+    ax.set_title(title if title is not None else f"Electricity spot price — {day_title}")
+    _style_day_xaxis(ax, day_start, xlim=xlim)
+
+    if standalone and created_fig is not None:
+        _legend_ordered_below(created_fig, ax, [_LAB_SPOT], ncol=1)
+        plt.show()
+    return ax
+
+
 def _thesis_slack_line(
     ax,
     slack_min,
@@ -372,6 +429,77 @@ def plot_thesis_slack_unmet(sens: pd.DataFrame) -> plt.Axes:
     ax.set_title("Unmet EV energy vs deadline slack")
     _style_slack_xaxis(ax, slack)
     _legend_ordered_below(fig, ax, ["Unmet energy (online)"], ncol=1)
+    plt.show()
+    return ax
+
+
+def plot_thesis_monthly_peaks_ev(
+    monthly_df: pd.DataFrame,
+    *,
+    month_col: str = "month",
+    baseline_col: str = "baseline_peak_kw",
+    offline_col: str = "deterministic_peak_kw",
+    online_col: str = "online_planner_peak_kw",
+    title: str = "Monthly peak power — baseline vs offline vs online (planner-only)",
+    ylim_bottom: float = 2000.0,
+) -> plt.Axes:
+    """Grouped bar chart of monthly peaks (thesis style, notebook 09 Part 5)."""
+    apply_thesis_rc()
+    df = monthly_df.copy()
+    months = df[month_col].astype(str).tolist()
+    x = np.arange(len(months))
+    width = 0.26
+
+    base = pd.to_numeric(df[baseline_col], errors="coerce")
+    off = pd.to_numeric(df[offline_col], errors="coerce")
+    on = pd.to_numeric(df[online_col], errors="coerce")
+    peak_vals = np.concatenate([base.values, off.values, on.values])
+    ymax = float(np.nanmax(peak_vals)) * 1.05
+
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    ax.set_axisbelow(True)
+    ax.bar(
+        x - width,
+        base,
+        width,
+        label="Baseline",
+        color=C_BASELINE,
+        alpha=0.85,
+        edgecolor="none",
+    )
+    ax.bar(
+        x,
+        off,
+        width,
+        label="Offline",
+        color=C_OFFLINE,
+        alpha=0.85,
+        edgecolor="none",
+    )
+    ax.bar(
+        x + width,
+        on,
+        width,
+        label="Online (planner-only)",
+        color=C_ONLINE,
+        alpha=0.85,
+        edgecolor="none",
+    )
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Monthly peak power (kW)")
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(months, rotation=45, ha="right")
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    _legend_ordered_below(
+        fig,
+        ax,
+        ["Baseline", "Offline", "Online (planner-only)"],
+        ncol=3,
+    )
+    plt.tight_layout()
+    ax.set_autoscaley_on(False)
+    ax.set_ylim(ylim_bottom, ymax)
     plt.show()
     return ax
 

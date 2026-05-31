@@ -45,6 +45,7 @@ INSERT_AFTER_DAY_MERGE = """
 """ + IMPORT_BLOCK + """
 _ev_thesis.plot_thesis_day_ev_power(_day_merge, selected_day_start, show_window=True)
 _ev_thesis.plot_thesis_day_grid_power(_day_merge, selected_day_start)
+_ev_thesis.plot_thesis_day_spot_price(_day_merge, selected_day_start)
 
 """
 

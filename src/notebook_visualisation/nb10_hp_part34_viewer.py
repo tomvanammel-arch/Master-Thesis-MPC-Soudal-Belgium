@@ -471,9 +471,11 @@ def run_notebook10_part31_optimized_volumes(res_hp_online: pd.DataFrame, project
     plt.tight_layout()
     plt.show()
 
-    # --- Plot: one day (ZOH, thesis style, three separate figures) ---
+    # --- Plot: one day (ZOH, thesis style, four separate figures) ---
     import matplotlib as mpl
     import matplotlib.dates as mdates
+
+    from notebook_visualisation.nb09_ev_part34_viewer import plot_thesis_day_spot_price
 
     mpl.rcParams.update(
         {
@@ -579,6 +581,9 @@ def run_notebook10_part31_optimized_volumes(res_hp_online: pd.DataFrame, project
     if det_hp_15min is not None:
         day_det = det_hp_15min[(det_hp_15min["timestamp"] >= DAY) & (det_hp_15min["timestamp"] < _day_end)].copy()
 
+    if "price" not in day.columns and "price" in plant.columns:
+        day = day.merge(plant[["timestamp", "price"]], on="timestamp", how="left")
+
     _st_day = (
         day["forecast_access_exceedance_active"]
         if "forecast_access_exceedance_active" in day.columns
@@ -635,6 +640,9 @@ def run_notebook10_part31_optimized_volumes(res_hp_online: pd.DataFrame, project
     _style_day_xaxis(ax_s)
     _legend_below(fig_s, ax_s)
     plt.show()
+
+    # 4) Electricity spot price (thesis style, ZOH — same as notebook 09 Part 4.3)
+    plot_thesis_day_spot_price(day, DAY, xlim=(DAY, _day_end))
 
     # --- Debug: what the optimizer sees at a specific timestamp (24h MPC window) ---
     # Mirrors the EV debug idea from notebook 09, but for HP.
@@ -2048,3 +2056,17 @@ def run_notebook10_forecast_stress_hours_by_quantile(project_root: Path) -> None
     ax.set_ylim(0.0, ymax * 1.25 + 0.5)
     fig.subplots_adjust(top=0.90, bottom=0.14)
     plt.show()
+
+
+def plot_thesis_monthly_peaks_hp(monthly_df: pd.DataFrame, **kwargs):
+    """Grouped monthly peak bars for notebook 10 Part 5 (reuses EV thesis plot helper)."""
+    from notebook_visualisation.nb09_ev_part34_viewer import plot_thesis_monthly_peaks_ev
+
+    defaults = {
+        "baseline_col": "baseline_peak_kw",
+        "offline_col": "deterministic_peak_kw",
+        "online_col": "online_planner_peak_kw",
+        "title": "Monthly peak power — baseline vs offline vs online (planner-only HP)",
+    }
+    defaults.update(kwargs)
+    return plot_thesis_monthly_peaks_ev(monthly_df, **defaults)

@@ -1,7 +1,7 @@
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -173,6 +173,7 @@ def run_ev_online_mpc_1(
     log_prefix: str = "[Online MPC]",
     enable_mpc_window_debug: bool = True,
     mpc_window_debug_csv_path: Optional[str] = None,
+    actuator_mode: Literal["full", "planner_only"] = "full",
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Run a full-year EV-only online myopic MPC simulation (thesis §3.7.2).
@@ -182,10 +183,11 @@ def run_ev_online_mpc_1(
       `forecast_inflex_load_rolling_horizon.csv`, optional PV forecast CSV.
     - Planner: `mpc_ev_24h` each step (access soft via rolling-12 over-usage; exogenous
       EV column: first horizon step `ev_actual[k-1]`, remaining steps flat forecast at k).
-    - Actuator: clipping with **Equation (3.50)** in the MPC region; optional
-      **headroom-aware enforce** (12:00–17:00): after a clip, add only the minimum
-      kWh when blended `ev_to_deliver` cannot still be met via envelope through
-      17:00; otherwise defer to catch-up (`[17:00−slack, 17:00)`).
+    - Actuator (`actuator_mode="full"`): clipping with **Equation (3.50)** in the MPC
+      region; optional **headroom-aware enforce** (12:00–17:00); catch-up after slack.
+    - Actuator (`actuator_mode="planner_only"`): thesis steps **0, 1, 2, 6** only —
+      apply first-step planner output with actual inflex/PV (no clip, catch-up, enforce;
+      `ev_deadline_slack_minutes=0`; MPC on full weekday 07:00–17:00 window).
 
     Returns
     -------
@@ -194,6 +196,18 @@ def run_ev_online_mpc_1(
     summary : dict
         Aggregate summary (e.g. monthly peaks, uncharged energy stats, bills).
     """
+    planner_only = actuator_mode == "planner_only"
+    if planner_only:
+        if ev_deadline_slack_minutes != 0 and verbose:
+            print(
+                f"{log_prefix} planner_only: ignoring ev_deadline_slack_minutes="
+                f"{ev_deadline_slack_minutes} (forced to 0)"
+            )
+        if enforce_daily_ev_demand and verbose:
+            print(f"{log_prefix} planner_only: ignoring enforce_daily_ev_demand=True")
+        ev_deadline_slack_minutes = 0
+        enforce_daily_ev_demand = False
+        enable_mpc_window_debug = False
     # Paths
     plant_path = PROJECT_ROOT / "data" / "plant1.csv"
     # Use the rolling-horizon EV forecast exported by notebook 05
@@ -204,7 +218,12 @@ def run_ev_online_mpc_1(
 
     if verbose:
         print("=" * 80)
-        print("EV-only Online MPC 1 – Full-year simulation")
+        title = (
+            "EV-only Online MPC 1 – Planner-only (thesis steps 0,1,2,6)"
+            if planner_only
+            else "EV-only Online MPC 1 – Full-year simulation"
+        )
+        print(title)
         print("=" * 80)
         print(f"  EV forecast strategy:        {forecast_strategy_ev}")
         print(f"  Inflex forecast strategy:    {forecast_strategy_inflex}")
@@ -474,8 +493,12 @@ def run_ev_online_mpc_1(
         # MPC is only meaningful once the EV window starts at 07:00.
         # Use [7:00, mpc_ramp_end) for MPC, [mpc_ramp_end, base_end) for catch-up,
         # so the final slack period before the true deadline is treated as catch-up.
-        in_mpc_region = (tod >= 7.0) and (tod < mpc_ramp_end)
-        in_catchup_region = (tod >= mpc_ramp_end) and (tod < base_end)
+        if planner_only:
+            in_mpc_region = bool(in_ev_window)
+            in_catchup_region = False
+        else:
+            in_mpc_region = (tod >= 7.0) and (tod < mpc_ramp_end)
+            in_catchup_region = (tod >= mpc_ramp_end) and (tod < base_end)
 
         # (No routine debug prints here; only on MPC failure in the try/except below.)
 
@@ -727,57 +750,71 @@ def run_ev_online_mpc_1(
             p_grid_plan = 4.0 * (inflex_act_kwh + ev_plan_kwh - pv_act_kwh)
             p_grid_plan_kw_ts[k] = p_grid_plan
 
-            # Real-time peak limit (thesis Eq. 3.50): P_lim = min(P_access, max(P_peak,sofar, P_target))
-            p_target_kw = current_peak_opt_kw
-            inner = max(peak_sofar_kw, p_target_kw)
-            p_limit = min(access_kw, inner) if access_kw > 0 else inner
-            p_limit_kw_ts[k] = p_limit
-
-            # Clipping flag: True when planned grid power exceeds allowed limit
-            was_clipped = p_grid_plan > p_limit
-
-            if not was_clipped:
-                p_ev_new = ev_plan_kw
+            if planner_only:
+                # Thesis steps 3+6: apply planner first step; actual inflex/PV for realised grid.
+                p_limit = float("nan")
+                p_limit_kw_ts[k] = p_limit
+                was_clipped = False
+                was_clipped_ts[k] = 0.0
+                ev_enforce_extra_kwh = 0.0
+                ev_enforce_active = 0.0
+                ev_enforce_deferred = 0.0
+                ev_enforce_extra_kwh_ts[k] = 0.0
+                ev_enforce_active_ts[k] = 0.0
+                ev_enforce_deferred_ts[k] = 0.0
+                ev_applied_kwh = ev_plan_kwh
             else:
-                delta_p = p_grid_plan - p_limit
-                p_ev_new = max(ev_plan_kw - delta_p, 0.0)
+                # Real-time peak limit (thesis Eq. 3.50): P_lim = min(P_access, max(P_peak,sofar, P_target))
+                p_target_kw = current_peak_opt_kw
+                inner = max(peak_sofar_kw, p_target_kw)
+                p_limit = min(access_kw, inner) if access_kw > 0 else inner
+                p_limit_kw_ts[k] = p_limit
 
-            was_clipped_ts[k] = 1.0 if was_clipped else 0.0
-            ev_enforce_extra_kwh = 0.0
-            ev_enforce_active = 0.0
-            ev_enforce_deferred = 0.0
-            ev_clipped_kwh = p_ev_new / 4.0
+                # Clipping flag: True when planned grid power exceeds allowed limit
+                was_clipped = p_grid_plan > p_limit
 
-            headroom_after_kwh = 0.0
-            if tod >= 12.0:
-                headroom_kwh = _ev_envelope_energy_remaining_kwh(
-                    k, n, ts, ev_power_envelope_actual_kw_ts
-                )
-                headroom_after_kwh = _ev_envelope_headroom_after_step_kwh(
-                    k, n, ts, ev_power_envelope_actual_kw_ts
-                )
-                ev_envelope_remaining_kwh_ts[k] = headroom_kwh
-                ev_envelope_headroom_after_kwh_ts[k] = headroom_after_kwh
-                ev_envelope_feasible_ts[k] = (
-                    1.0 if ev_to_deliver <= headroom_kwh + 1e-6 else 0.0
-                )
+                if not was_clipped:
+                    p_ev_new = ev_plan_kw
+                else:
+                    delta_p = p_grid_plan - p_limit
+                    p_ev_new = max(ev_plan_kw - delta_p, 0.0)
 
-            if enforce_daily_ev_demand and tod >= 12.0 and was_clipped:
-                ev_clipped_kwh, ev_enforce_extra_kwh, ev_enforce_active, ev_enforce_deferred = (
-                    _apply_ev_enforce_minimal_after_clip(
-                        ev_to_deliver,
-                        ev_clipped_kwh,
-                        float(ev_power_envelope_actual_kw_ts[k]),
-                        headroom_after_kwh,
+                was_clipped_ts[k] = 1.0 if was_clipped else 0.0
+                ev_enforce_extra_kwh = 0.0
+                ev_enforce_active = 0.0
+                ev_enforce_deferred = 0.0
+                ev_clipped_kwh = p_ev_new / 4.0
+
+                headroom_after_kwh = 0.0
+                if tod >= 12.0:
+                    headroom_kwh = _ev_envelope_energy_remaining_kwh(
+                        k, n, ts, ev_power_envelope_actual_kw_ts
                     )
-                )
-                p_ev_new = 4.0 * ev_clipped_kwh
+                    headroom_after_kwh = _ev_envelope_headroom_after_step_kwh(
+                        k, n, ts, ev_power_envelope_actual_kw_ts
+                    )
+                    ev_envelope_remaining_kwh_ts[k] = headroom_kwh
+                    ev_envelope_headroom_after_kwh_ts[k] = headroom_after_kwh
+                    ev_envelope_feasible_ts[k] = (
+                        1.0 if ev_to_deliver <= headroom_kwh + 1e-6 else 0.0
+                    )
 
-            ev_enforce_extra_kwh_ts[k] = ev_enforce_extra_kwh
-            ev_enforce_active_ts[k] = ev_enforce_active
-            ev_enforce_deferred_ts[k] = ev_enforce_deferred
+                if enforce_daily_ev_demand and tod >= 12.0 and was_clipped:
+                    ev_clipped_kwh, ev_enforce_extra_kwh, ev_enforce_active, ev_enforce_deferred = (
+                        _apply_ev_enforce_minimal_after_clip(
+                            ev_to_deliver,
+                            ev_clipped_kwh,
+                            float(ev_power_envelope_actual_kw_ts[k]),
+                            headroom_after_kwh,
+                        )
+                    )
+                    p_ev_new = 4.0 * ev_clipped_kwh
 
-            ev_applied_kwh = ev_clipped_kwh
+                ev_enforce_extra_kwh_ts[k] = ev_enforce_extra_kwh
+                ev_enforce_active_ts[k] = ev_enforce_active
+                ev_enforce_deferred_ts[k] = ev_enforce_deferred
+
+                ev_applied_kwh = ev_clipped_kwh
             ev_applied[k] = ev_applied_kwh
             charged_ev_by_date[date_k] = charged_ev_by_date.get(date_k, 0.0) + ev_applied_kwh
 
@@ -791,7 +828,7 @@ def run_ev_online_mpc_1(
             monthly_peak_time_series[k] = float(monthly_peak_so_far[month_key])
             effective_peak_time_series[k] = float(monthly_peak_so_far[month_key])
 
-        elif in_catchup_region:
+        elif in_catchup_region and not planner_only:
             # --- Catch-up window: try to deliver remaining energy now, capped by clipping ---
             # Use ev_to_deliver from the blended daily demand minus charged_so_far.
             remaining = ev_to_deliver
@@ -960,6 +997,8 @@ def run_ev_online_mpc_1(
         "enforce_daily_ev_demand": enforce_daily_ev_demand,
         "ev_enforce_steps": int(np.sum(ev_enforce_active_ts > 0)),
         "ev_enforce_extra_kwh_total": float(np.sum(ev_enforce_extra_kwh_ts)),
+        "actuator_mode": actuator_mode,
+        "thesis_steps": "0,1,2,6" if planner_only else "0-6",
     }
 
     if enable_mpc_window_debug and debug_rows:
@@ -998,6 +1037,29 @@ def run_ev_online_mpc_1(
         print("=" * 80)
 
     return res, summary
+
+
+def run_ev_online_mpc_planner_only(
+    forecast_strategy_ev: str = "a",
+    forecast_strategy_inflex: str = "a",
+    forecast_strategy_pv: str = "actual",
+    access_power_by_month: Dict[str, float] = None,
+    verbose: bool = True,
+    log_prefix: str = "[Planner-only MPC]",
+) -> Tuple[pd.DataFrame, Dict]:
+    """Full-year EV online MPC with thesis §3.7.2 steps 0, 1, 2, 6 only (no actuator layer)."""
+    return run_ev_online_mpc_1(
+        forecast_strategy_ev=forecast_strategy_ev,
+        forecast_strategy_inflex=forecast_strategy_inflex,
+        forecast_strategy_pv=forecast_strategy_pv,
+        ev_deadline_slack_minutes=0,
+        enforce_daily_ev_demand=False,
+        access_power_by_month=access_power_by_month,
+        verbose=verbose,
+        log_prefix=log_prefix,
+        enable_mpc_window_debug=False,
+        actuator_mode="planner_only",
+    )
 
 
 if __name__ == "__main__":
